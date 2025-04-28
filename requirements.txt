@@ -5,7 +5,8 @@ python-dotenv>=1.0.0
 uvicorn>=0.27.0
 pydantic>=2.6.0
 pydantic-settings>=2.1.0
-pinecone-client>=3.0.0
+pinecone
+pinecone-plugins
 twilio>=8.12.0
 python-multipart>=0.0.7
 pytest>=8.0.0
