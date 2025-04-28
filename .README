@@ -1,0 +1,180 @@
+# Voice-AI Agent (main.py)
+
+A FastAPI service that bridges Twilio Media Streams ↔ OpenAI Realtime API, with Pinecone for Q&A and N8N for appointment booking.
+
+## Table of Contents
+
+1. [Overview](#overview)  
+2. [Prerequisites](#prerequisites)  
+3. [Installation](#installation)  
+4. [Configuration](#configuration)  
+5. [Running Locally](#running-locally)  
+6. [Architecture](#architecture)  
+7. [Endpoints](#endpoints)  
+8. [Example Flow](#example-flow)  
+9. [Testing](#testing)  
+10. [Deployment](#deployment)  
+11. [Troubleshooting](#troubleshooting)  
+12. [Next Steps](#next-steps)  
+
+## Overview
+
+Build a real-time voice AI agent using FastAPI that receives Twilio audio, forwards it to OpenAI's realtime speech-to-speech API, and handles two LLM-driven tools (QA via Pinecone + booking via N8N).
+
+## Prerequisites
+
+- Python 3.10 or higher  
+- Twilio account with Media Streams enabled  
+- OpenAI API access to Realtime speech models (e.g. `gpt-4o-realtime-preview`)  
+- Pinecone account with an index and assistant set up  
+- N8N instance with two workflows:  
+  - **Route 1**: fetch chat history and summary  
+  - **Route 3**: check/create calendar bookings  
+- A publicly accessible URL for your FastAPI service (e.g. via ngrok or cloud deployment)  
+
+## Installation
+
+```bash
+git clone <repo-url>
+cd <repo-directory>
+pip install -r requirements.txt
+
+Configuration
+
+Copy the example environment file and fill in your credentials:
+cp .env.example .env
+Edit .env and set:
+OPENAI_API_KEY=your_openai_api_key
+PINECONE_API_KEY=your_pinecone_api_key
+N8N_WEBHOOK_URL=https://your-n8n-instance/webhook
+REPL_PUBLIC_URL=https://your-service-url
+PORT=8000
+Running Locally
+
+Start the server with Uvicorn:
+
+uvicorn src.main:app --reload --host 0.0.0.0 --port $PORT
+Architecture
+
+Configuration & Initialization
+Loads environment variables (OpenAI, Pinecone, N8N, public URL)
+Defines a session store to track ongoing calls
+/incoming-call Endpoint
+HTTP POST from Twilio contains form data (e.g. From)
+Fetches prior chat history via N8N (route 1) to customize the first message
+Seeds a session and responds with TwiML <Connect><Stream> XML, pointing to /media-stream, including sessionId, firstMessage, and callerNumber
+/media-stream WebSocket Handler
+Accepts a WebSocket connection from Twilio Media Streams
+Reads the initial JSON handshake to obtain sessionId
+Opens a WebSocket client connection to the OpenAI Realtime API with the realtime=v1 beta header
+Sends a session.update event defining:
+Audio formats (g711_ulaw), server VAD, voice model (shimmer)
+System instructions prompt
+Modalities (text + audio)
+Temperature
+Function schemas for:
+question_and_answer(question: string)
+schedule_meeting(name: string, email: string, purpose: string, datetime: string, location: string)
+Bidirectional Relay Loop
+Twilio → App → OpenAI
+Receives Twilio "media" events with audio payloads, forwards as input.audio messages to OpenAI
+OpenAI → App → Twilio
+Streams back response.audio.delta frames, forwarded as Twilio "media" events so the caller hears the agent in near-real time
+Function Calls
+OpenAI signals response.function_call_arguments.done when calling a tool; the app dispatches accordingly
+Function Call Dispatcher
+question_and_answer
+Uses Pinecone Assistant SDK to query a knowledge base, streams chunks into a full answer string
+Returns the answer via function_call_output and a final response.create
+schedule_meeting
+Maps location to a calendar ID
+Posts meeting details to N8N (route 3) to check availability or create an event
+Returns confirmation or alternative times via LLM response
+Helper Utilities
+send_to_n8n() abstracts POST calls to N8N, ideally using an async HTTP client (httpx.AsyncClient)
+Error Handling & Timeouts
+Use timeouts for external calls
+Gracefully close WebSockets on disconnect
+Structured logging for debugging
+Endpoints
+
+POST /incoming-call
+Input: Twilio webhook form data (e.g. From, To)
+Action:
+Fetch chat history (route: 1) via N8N
+Seed session store
+Return TwiML to connect and start media streaming
+WS /media-stream
+Handshake: Expects initial JSON with sessionId
+Stream In: Twilio audio events mapped to OpenAI input.audio
+Stream Out: OpenAI response.audio.delta mapped back to Twilio "media" events
+Function Calls: Handles Q&A and booking workflows
+Example Flow
+
+User calls the number
+Twilio sends /incoming-call request; the app returns TwiML
+Twilio opens a WebSocket to /media-stream
+The caller speaks; audio flows to OpenAI
+OpenAI responds (e.g. greeting, answers questions, books meetings)
+The caller hears the agent in real time
+Testing
+
+Unit Tests:
+Mock Twilio form parsing
+Mock session store
+Mock Pinecone and N8N HTTP calls
+Integration Tests:
+Simulate Twilio WebSocket audio frames
+Mock OpenAI Realtime WS with canned responses
+Load Tests:
+Use tools like locust or k6 to simulate concurrent calls
+Deployment
+
+Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+Kubernetes / ECS / Compose
+Set environment variables via secrets
+Health check on /
+Monitoring
+Expose Prometheus metrics (latency, errors, active sessions)
+Alerts on high error rates or stream dropouts
+Troubleshooting
+
+No session found
+Ensure Twilio passes the correct sessionId
+Check logs for session creation entries
+Timeouts on N8N or Pinecone
+Increase HTTP client timeouts
+Verify network connectivity to webhook URL
+Latency too high
+Confirm use of async HTTP client
+Optimize Pinecone queries (index size, chunking)
+
+## Next Steps
+
+1. **Create a `requirements.txt` file**:
+   - List all dependencies required for the project (FastAPI, httpx, websockets, python-dotenv, etc.).
+
+2. **Set up a `.env` file**:
+   - Create a `.env` file to store environment variables like `OPENAI_API_KEY`, `PINECONE_API_KEY`, `N8N_WEBHOOK_URL`, `REPL_PUBLIC_URL`, and `PORT`.
+
+3. **Implement Pinecone Integration**:
+   - Integrate Pinecone to fetch real answers from the knowledge base for the Q&A function.
+
+4. **Implement N8N Integration**:
+   - Ensure the meeting scheduling function correctly interacts with N8N to check availability and create events.
+
+5. **Testing**:
+   - Set up unit tests for the FastAPI endpoints and WebSocket handlers.
+   - Test the integration with Twilio, OpenAI, Pinecone, and N8N.
+
+6. **Error Handling and Logging**:
+   - Enhance error handling and logging to make debugging easier.
+
+7. **Deployment**:
+   - Prepare for deployment by setting up Docker and ensuring the service can run in a production environment.
+
