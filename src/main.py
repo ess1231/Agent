@@ -10,7 +10,6 @@ from pydantic_settings import BaseSettings
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone
-from pinecone_plugins.assistant.models.chat import Message
 
 # Load environment variables
 load_dotenv()
@@ -42,21 +41,25 @@ sessions: Dict[str, Dict] = {}
 # Initialize Pinecone client lazily
 _pinecone_client = None
 _pinecone_index = None
-_pinecone_assistant = None
 
-def get_pinecone_assistant():
-    global _pinecone_client, _pinecone_assistant
+def get_pinecone_index():
+    global _pinecone_client, _pinecone_index
     if _pinecone_client is None:
         try:
             _pinecone_client = Pinecone(api_key=settings.pinecone_api_key)
-            _pinecone_assistant = _pinecone_client.assistant.Assistant(assistant_name="rag-tool")
+            _pinecone_index = _pinecone_client.Index("voice-agent")  # Change to your actual index name
         except Exception as e:
             logger.error(f"Failed to initialize Pinecone: {e}")
             return None
-    return _pinecone_assistant
+    return _pinecone_index
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Helper function to format phone number
+def format_phone_number(number: str) -> str:
+    """Format phone number by removing the plus sign and any non-digit characters."""
+    return ''.join(filter(str.isdigit, number))
 
 # Helper function to create UltraVox call
 async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
@@ -114,7 +117,7 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
 # Helper function to send requests to N8N
 async def send_to_n8n(route: str, number: str, payload: Optional[Dict] = None) -> Dict:
     async with httpx.AsyncClient() as client:
-        data = {"route": route, "number": number}
+        data = {"route": route, "number": format_phone_number(number)}
         if payload:
             data["payload"] = payload
         response = await client.post(settings.n8n_webhook_url, json=data)
@@ -122,14 +125,26 @@ async def send_to_n8n(route: str, number: str, payload: Optional[Dict] = None) -
 
 # Helper function to query Pinecone
 async def query_pinecone(question: str) -> str:
-    assistant = get_pinecone_assistant()
-    if assistant is None:
-        logger.warning("Pinecone assistant not available, returning mock response")
+    index = get_pinecone_index()
+    if index is None:
+        logger.warning("Pinecone index not available, returning mock response")
         return f"Here's what I found about '{question}' in our knowledge base..."
-    
     try:
-        response = assistant.chat(messages=[Message(content=question)], stream=True)
-        return " ".join([chunk.content for chunk in response])
+        # Use the latest Pinecone search API
+        results = index.search(
+            namespace="default",  # Change if you use a different namespace
+            query={
+                "top_k": 3,
+                "inputs": {
+                    "text": question
+                }
+            }
+        )
+        hits = results.get('result', {}).get('hits', [])
+        if not hits:
+            return "Sorry, I couldn't find anything relevant in the knowledge base."
+        # Return the top result's text
+        return hits[0]['fields']['chunk_text']
     except Exception as e:
         logger.error(f"Error querying Pinecone: {e}")
         return "I'm sorry, I couldn't access the knowledge base at the moment."
@@ -169,7 +184,7 @@ async def incoming_call(request: Request) -> Response:
     first_message = history.get("firstMessage", "Hello! How can I help you today?")
 
     # Create a session
-    session_id = f"session_{caller}"
+    session_id = f"session_{format_phone_number(caller)}"
     sessions[session_id] = {"caller": caller, "first_message": first_message}
 
     # Generate TwiML to connect to media stream
@@ -301,4 +316,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=settings.port) 
+    uvicorn.run(app, host="0.0.0.0", port=settings.port)
