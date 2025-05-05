@@ -112,7 +112,10 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
                 ]
             }
         )
-        return response.json()["joinUrl"]
+        if response.status_code != 200:
+            logger.error(f"UltraVox API error {response.status_code}: {response.text}")
+            return None
+        return response.json().get("joinUrl")
 
 # Helper function to send requests to N8N
 async def send_to_n8n(route: str, number: str, payload: Optional[Dict] = None) -> Dict:
@@ -228,7 +231,10 @@ async def media_stream(websocket: WebSocket):
         # Create UltraVox call and get join URL
         system_prompt = "You are a helpful voice assistant. Answer questions and help schedule meetings."
         join_url = await create_ultravox_call(system_prompt, session["first_message"])
-
+        if not join_url:
+            logger.error("Failed to get joinUrl from UltraVox. Closing WebSocket.")
+            await websocket.close()
+            return
         # Connect to UltraVox WebSocket
         ultravox_ws = await websockets.connect(join_url)
 
