@@ -240,28 +240,87 @@ async def media_stream(websocket: WebSocket):
         msg = await websocket.receive_json()
         logger.info(f"Twilio event received: {msg}")
         if msg.get("event") != "connected":
-            logger.error("Expected 'connected' event as first message")
-            await websocket.close()
-            return
-
-        # 2. Wait for 'start' event, extract sessionId from parameters
+            logger.warning(f"Expected 'connected' event but got: {msg.get('event')}")
+            # Continue anyway - some clients might have different handshakes
+        
+        # 2. Wait for 'start' event, extract sessionId from multiple possible locations
         msg = await websocket.receive_json()
-        logger.info(f"Twilio event received: {msg}")
+        logger.info(f"Twilio event received: {json.dumps(msg)}")  # Log entire message for debugging
+        
+        # Extract sessionId from various possible locations in the event
         if msg.get("event") == "start":
-            parameters = msg.get("start", {}).get("parameters", {})
-            session_id = parameters.get("sessionId")
-            logger.info(f"Extracted sessionId from Twilio: {session_id}")
+            # Try multiple paths where sessionId might be found
+            start_data = msg.get("start", {})
+            custom_parameters = start_data.get("customParameters", {})
+            regular_parameters = start_data.get("parameters", {})
+            
+            # Log all potential locations for debugging
+            logger.info(f"Start data: {json.dumps(start_data)}")
+            logger.info(f"Custom parameters: {json.dumps(custom_parameters)}")
+            logger.info(f"Regular parameters: {json.dumps(regular_parameters)}")
+            
+            # Try multiple locations for sessionId, with specific logging
+            session_id = custom_parameters.get("sessionId")
+            if session_id:
+                logger.info(f"Found sessionId in customParameters: {session_id}")
+            else:
+                session_id = regular_parameters.get("sessionId")
+                if session_id:
+                    logger.info(f"Found sessionId in parameters: {session_id}")
+                else:
+                    # Try one more fallback - caller ID / phone number
+                    account_sid = start_data.get("accountSid")
+                    stream_sid = start_data.get("streamSid")
+                    logger.info(f"No sessionId found. AccountSid: {account_sid}, StreamSid: {stream_sid}")
+                    
+                    # Look for call info in the event that might contain a phone number
+                    caller = None
+                    for key in start_data:
+                        if isinstance(start_data[key], dict) and "from" in start_data[key]:
+                            caller = start_data[key].get("from")
+                            break
+                    
+                    if caller:
+                        logger.info(f"Found caller in start event: {caller}")
+                        session_id = f"session_{format_phone_number(caller)}"
         else:
-            logger.error("Expected 'start' event as second message")
+            logger.warning(f"Expected 'start' event but got: {msg.get('event')}")
+        
+        logger.info(f"Final extracted sessionId: {session_id}")
+        
+        # Show all available sessions for debugging
+        logger.info(f"Available sessions: {list(sessions.keys())}")
+        
+        # Check if session exists - with fallback options
+        if not session_id:
+            logger.error("Could not extract a sessionId from the Twilio event")
             await websocket.close()
             return
-
-        if not session_id or session_id not in sessions:
+            
+        if session_id not in sessions:
+            # If the exact session is not found, try normalizing the phone number
+            logger.warning(f"Session {session_id} not found in active sessions")
+            
+            # Try a secondary lookup based on phone numbers if it looks like a phone-based session
+            if session_id.startswith("session_"):
+                phone_part = session_id[8:]  # Extract just the phone number part
+                # Look for sessions with similar phone numbers
+                for existing_id, session_data in sessions.items():
+                    if existing_id.startswith("session_"):
+                        existing_phone = existing_id[8:]
+                        if phone_part in existing_phone or existing_phone in phone_part:
+                            logger.info(f"Found similar session: {existing_id}")
+                            session_id = existing_id
+                            break
+        
+        if session_id not in sessions:
             logger.error(f"Invalid or missing sessionId: {session_id}")
             await websocket.close()
             return
-
+        
+        logger.info(f"Successfully found session: {session_id}")
         session = sessions[session_id]
+        
         # Initialize OpenAI conversation
         messages = [
             {
