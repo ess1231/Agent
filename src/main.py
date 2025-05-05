@@ -40,11 +40,27 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Initialize OpenAI client
-openai_client = OpenAI(api_key=settings.openai_api_key)
+try:
+    openai_client = OpenAI(
+        api_key=settings.openai_api_key,
+        timeout=30.0,  # Add timeout
+        max_retries=3  # Add retries
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    raise
 
 # Initialize Pinecone client
-pinecone = Pinecone(api_key=settings.pinecone_api_key)
-pinecone_index = pinecone.Index(settings.pinecone_index_name)
+try:
+    pinecone = Pinecone(
+        api_key=settings.pinecone_api_key,
+        environment=settings.pinecone_environment
+    )
+    pinecone_index = pinecone.Index(name="voice-agent")
+    logger.info(f"Successfully connected to Pinecone index: voice-agent")
+except Exception as e:
+    logger.error(f"Failed to initialize Pinecone client: {e}")
+    raise
 
 # Session store to track ongoing calls
 sessions: Dict[str, Dict] = {}
