@@ -11,6 +11,7 @@ import os
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from openai import OpenAI
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +35,7 @@ class Settings(BaseSettings):
     # Other settings
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "")
     port: int = int(os.getenv("PORT", "8080"))
+    domain: str = os.getenv("RAILWAY_STATIC_URL", "localhost:8080")
 
 settings = Settings()
 
@@ -112,6 +114,55 @@ async def schedule_meeting(meeting_details: Dict) -> Dict:
         logger.error(f"Error scheduling meeting: {e}")
         return {"error": "Failed to schedule meeting"}
 
+# Helper function to fetch chat history from N8N
+async def fetch_chat_history(caller: str) -> Dict:
+    """Fetch chat history from N8N and return the first message."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                settings.n8n_webhook_url,
+                json={
+                    "route": "fetch_chat_history",
+                    "caller": caller
+                }
+            )
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error fetching chat history: {e}")
+        return {"firstMessage": "Hello! How can I help you today?"}
+
+# Helper function to save transcript and summary to N8N
+async def save_transcript_summary(session_id: str, transcript: str) -> Dict:
+    """Save transcript and generate a summary using OpenAI, then send to N8N."""
+    try:
+        # Generate summary using OpenAI
+        summary_response = openai_client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": "Summarize the following conversation in a few sentences."},
+                {"role": "user", "content": transcript}
+            ],
+            temperature=0.7,
+            max_tokens=100
+        )
+        summary = summary_response.choices[0].message.content
+
+        # Send transcript and summary to N8N
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                settings.n8n_webhook_url,
+                json={
+                    "route": "save_transcript_summary",
+                    "session_id": session_id,
+                    "transcript": transcript,
+                    "summary": summary
+                }
+            )
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error saving transcript and summary: {e}")
+        return {"error": "Failed to save transcript and summary"}
+
 # Incoming call endpoint
 @app.post("/incoming-call")
 async def incoming_call(request: Request) -> Response:
@@ -124,19 +175,24 @@ async def incoming_call(request: Request) -> Response:
             
         logger.info(f"Incoming call from {caller}")
 
+        # Fetch chat history and get first message
+        chat_history = await fetch_chat_history(caller)
+        first_message = chat_history.get("firstMessage", "Hello! How can I help you today?")
+
         # Create a session
         session_id = f"session_{format_phone_number(caller)}"
         sessions[session_id] = {
             "caller": caller,
             "transcript": "",
-            "first_message": "Hello! How can I help you today?"
+            "first_message": first_message,
+            "created_at": datetime.now().isoformat()
         }
 
-        # Generate TwiML to connect to media stream
+        # Generate TwiML to connect to media stream using domain from settings
         twiml = f"""
         <Response>
             <Connect>
-                <Stream url="wss://{request.base_url.hostname}/media-stream">
+                <Stream url="wss://{settings.domain}/media-stream">
                     <Parameter name="sessionId" value="{session_id}"/>
                 </Stream>
             </Connect>
@@ -190,7 +246,7 @@ async def media_stream(websocket: WebSocket):
             },
             {
                 "role": "assistant",
-                "content": "Hello! This is Alex. How can I help you today?"
+                "content": session["first_message"]
             }
         ]
 
@@ -202,47 +258,57 @@ async def media_stream(websocket: WebSocket):
                 if data.get("event") == "media":
                     audio_data = data.get("media", {}).get("payload")
                     
-                    if audio_data:
+                    if not audio_data:
+                        logger.warning("Received media event without payload")
+                        continue
+                        
+                    try:
                         # Convert audio to text using OpenAI
                         audio_text = openai_client.audio.transcriptions.create(
                             model="whisper-1",
                             file=audio_data
                         ).text
+                    except Exception as e:
+                        logger.error(f"Error transcribing audio: {e}")
+                        continue
                         
-                        # Add to transcript
-                        session["transcript"] += f"\nUser: {audio_text}"
-                        
-                        # Add to conversation
-                        messages.append({"role": "user", "content": audio_text})
-                        
-                        # Check for conversation end
-                        if any(phrase in audio_text.lower() for phrase in ["goodbye", "bye", "thanks", "thank you"]):
+                    # Add to transcript
+                    session["transcript"] += f"\nUser: {audio_text}"
+                    
+                    # Add to conversation
+                    messages.append({"role": "user", "content": audio_text})
+                    
+                    # Check for conversation end
+                    if any(phrase in audio_text.lower() for phrase in ["goodbye", "bye", "thanks", "thank you"]):
+                        messages.append({
+                            "role": "assistant",
+                            "content": "You're welcome! Have a great day!"
+                        })
+                        # Save transcript and summary to N8N
+                        await save_transcript_summary(session_id, session["transcript"])
+                        break
+                    
+                    # Check if user wants to schedule a meeting
+                    if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
+                        # Extract meeting details using OpenAI
+                        meeting_details = await extract_meeting_details(audio_text)
+                        if meeting_details:
+                            result = await schedule_meeting(meeting_details)
                             messages.append({
                                 "role": "assistant",
-                                "content": "You're welcome! Have a great day!"
+                                "content": result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
                             })
-                            break
-                        
-                        # Check if user wants to schedule a meeting
-                        if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
-                            # Extract meeting details using OpenAI
-                            meeting_details = await extract_meeting_details(audio_text)
-                            if meeting_details:
-                                result = await schedule_meeting(meeting_details)
-                                messages.append({
-                                    "role": "assistant",
-                                    "content": result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
-                                })
-                            else:
-                                messages.append({
-                                    "role": "assistant",
-                                    "content": "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
-                                })
                         else:
-                            # Query knowledge base for answers
-                            answer = await query_knowledge_base(audio_text)
-                            messages.append({"role": "assistant", "content": answer})
-                        
+                            messages.append({
+                                "role": "assistant",
+                                "content": "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
+                            })
+                    else:
+                        # Query knowledge base for answers
+                        answer = await query_knowledge_base(audio_text)
+                        messages.append({"role": "assistant", "content": answer})
+                    
+                    try:
                         # Generate response using OpenAI
                         response = openai_client.chat.completions.create(
                             model=settings.openai_model,
@@ -269,8 +335,13 @@ async def media_stream(websocket: WebSocket):
                                 "payload": base64.b64encode(speech_response.content).decode()
                             }
                         })
+                    except Exception as e:
+                        logger.error(f"Error generating or sending response: {e}")
+                        continue
                         
                 elif data.get("event") == "stop":
+                    # Save transcript and summary to N8N
+                    await save_transcript_summary(session_id, session["transcript"])
                     break
                     
             except Exception as e:
