@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, Request, Response
+from fastapi import FastAPI, WebSocket, Request, Response, WebSocketDisconnect
 import httpx
 import json
 import base64
@@ -233,18 +233,18 @@ async def incoming_call(request: Request) -> Response:
 async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
     await websocket.accept()
-    
     try:
         # Read initial JSON handshake to get sessionId
         handshake = await websocket.receive_json()
         logger.info(f"WebSocket handshake received: {handshake}")
         session_id = handshake.get("sessionId")
-        
         if not session_id or session_id not in sessions:
             logger.error(f"Invalid or missing sessionId: {session_id}")
-            await websocket.close()
-            return
-
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass  # Already closed
+            return  # Critical: stop further processing
         session = sessions[session_id]
         
         # Initialize OpenAI conversation
@@ -373,10 +373,20 @@ async def media_stream(websocket: WebSocket):
                 logger.error(f"Error in conversation loop: {e}")
                 break
                 
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected cleanly.")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass  # Already closed
     finally:
-        await websocket.close()
+        # Only close if not already closed
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
 
 # Helper function to extract meeting details
 async def extract_meeting_details(text: str) -> Optional[Dict]:
