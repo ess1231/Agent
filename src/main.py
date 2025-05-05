@@ -13,6 +13,9 @@ from pinecone import Pinecone
 from openai import OpenAI
 from datetime import datetime
 import io
+import wave
+import audioop
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -189,6 +192,30 @@ async def save_transcript_summary(session_id: str, transcript: str) -> Dict:
         logger.error(f"Error saving transcript and summary: {e}")
         return {"error": "Failed to save transcript and summary"}
 
+# Helper function to convert mulaw audio to WAV for OpenAI
+def convert_mulaw_to_wav(mulaw_data, sample_rate=8000, channels=1):
+    """Convert Twilio's mulaw audio to WAV format that OpenAI can process."""
+    try:
+        # Convert mulaw to PCM
+        pcm_data = audioop.ulaw2lin(mulaw_data, 2)  # 2 bytes per sample
+        
+        # Create a temporary WAV file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+            with wave.open(temp_wav.name, 'wb') as wav_file:
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(2)  # 2 bytes per sample
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(pcm_data)
+            
+            # Read the WAV file back
+            with open(temp_wav.name, 'rb') as f:
+                wav_data = f.read()
+                
+        return wav_data
+    except Exception as e:
+        logger.error(f"Error converting mulaw to WAV: {e}")
+        return None
+
 # Incoming call endpoint
 @app.post("/incoming-call")
 async def incoming_call(request: Request) -> Response:
@@ -235,6 +262,7 @@ async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
     await websocket.accept()
     session_id = None
+    
     try:
         # 1. Wait for 'connected' event from Twilio
         msg = await websocket.receive_json()
@@ -326,14 +354,53 @@ async def media_stream(websocket: WebSocket):
             {
                 "role": "system",
                 "content": """You are a friendly and professional voice AI assistant. Your name is Alex. \
-                You are speaking to users over the phone, so keep your responses natural and conversational.\n\n                Guidelines:\n                1. Be friendly but professional\n                2. Keep responses concise but informative\n                3. If you don't know something, say so\n                4. For scheduling meetings, ask for: name, email, purpose, date/time, and location\n                5. Use natural pauses and conversational markers like 'um', 'let me see', etc.\n                6. If the user is unclear, ask clarifying questions\n                7. End conversations naturally when appropriate\n\n                Remember you're having a real-time conversation, so:\n                - Don't use markdown or special formatting\n                - Don't list items with numbers unless speaking them out\n                - Use natural speech patterns\n                - Keep responses brief but complete"""
+                You are speaking to users over the phone, so keep your responses natural and conversational.
+
+                Guidelines:
+                1. Be friendly but professional
+                2. Keep responses concise but informative
+                3. If you don't know something, say so
+                4. For scheduling meetings, ask for: name, email, purpose, date/time, and location
+                5. Use natural pauses and conversational markers like 'um', 'let me see', etc.
+                6. If the user is unclear, ask clarifying questions
+                7. End conversations naturally when appropriate
+
+                Remember you're having a real-time conversation, so:
+                - Don't use markdown or special formatting
+                - Don't list items with numbers unless speaking them out
+                - Use natural speech patterns
+                - Keep responses brief but complete"""
             },
             {
                 "role": "assistant",
                 "content": session["first_message"]
             }
         ]
-
+        
+        # IMPORTANT: Immediately send the welcome message
+        try:
+            logger.info(f"Sending welcome message: {session['first_message']}")
+            
+            # Generate welcome message audio
+            speech_response = openai_client.audio.speech.create(
+                model="tts-1",
+                voice=settings.openai_voice,
+                input=session["first_message"],
+                response_format="mp3",
+                speed=1.0
+            )
+            
+            # Send welcome audio to Twilio
+            await websocket.send_json({
+                "event": "media",
+                "media": {
+                    "payload": base64.b64encode(speech_response.content).decode()
+                }
+            })
+            logger.info("Welcome message sent successfully")
+        except Exception as e:
+            logger.error(f"Error sending welcome message: {e}")
+        
         # Main conversation loop
         while True:
             try:
@@ -343,50 +410,103 @@ async def media_stream(websocket: WebSocket):
                     if not audio_data:
                         logger.warning("Received media event without payload")
                         continue
+                    
+                    audio_text = None
                     try:
+                        # Decode base64 audio
                         audio_bytes = base64.b64decode(audio_data)
-                        audio_file = io.BytesIO(audio_bytes)
-                        audio_file.name = "audio.wav"
+                        
+                        # Convert mulaw to WAV format for OpenAI
+                        wav_bytes = convert_mulaw_to_wav(audio_bytes)
+                        if wav_bytes:
+                            audio_file = io.BytesIO(wav_bytes)
+                            audio_file.name = "audio.wav"
+                        else:
+                            # Fallback to raw decoding if conversion fails
+                            audio_file = io.BytesIO(audio_bytes)
+                            audio_file.name = "audio.wav"
+                        
+                        # Transcribe audio
                         audio_text = openai_client.audio.transcriptions.create(
                             model="whisper-1",
                             file=audio_file
                         ).text
+                        
+                        logger.info(f"Transcribed text: {audio_text}")
                     except Exception as e:
                         logger.error(f"Error transcribing audio: {e}")
+                        # Set a fallback message if transcription fails
+                        audio_text = "[Transcription failed. Please try again.]"
+                    
+                    # Skip empty transcriptions
+                    if not audio_text or audio_text.strip() == "":
+                        logger.warning("Empty transcription, skipping")
                         continue
+                    
+                    # Add to transcript
                     session["transcript"] += f"\nUser: {audio_text}"
+                    
+                    # Add to conversation
                     messages.append({"role": "user", "content": audio_text})
+                    
+                    # Check for conversation end
                     if any(phrase in audio_text.lower() for phrase in ["goodbye", "bye", "thanks", "thank you"]):
                         messages.append({
                             "role": "assistant",
                             "content": "You're welcome! Have a great day!"
                         })
+                        try:
+                            # Send goodbye message
+                            speech_response = openai_client.audio.speech.create(
+                                model="tts-1",
+                                voice=settings.openai_voice,
+                                input="You're welcome! Have a great day!",
+                                response_format="mp3",
+                                speed=1.0
+                            )
+                            
+                            await websocket.send_json({
+                                "event": "media",
+                                "media": {
+                                    "payload": base64.b64encode(speech_response.content).decode()
+                                }
+                            })
+                        except Exception as e:
+                            logger.error(f"Error sending goodbye message: {e}")
+                            
+                        # Save transcript
                         await save_transcript_summary(session_id, session["transcript"])
                         break
-                    if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
-                        meeting_details = await extract_meeting_details(audio_text)
-                        if meeting_details:
-                            result = await schedule_meeting(meeting_details)
-                            messages.append({
-                                "role": "assistant",
-                                "content": result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
-                            })
-                        else:
-                            messages.append({
-                                "role": "assistant",
-                                "content": "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
-                            })
-                    else:
-                        answer = await query_knowledge_base(audio_text)
-                        messages.append({"role": "assistant", "content": answer})
+                    
                     try:
-                        response = openai_client.chat.completions.create(
-                            model=settings.openai_model,
-                            messages=messages,
-                            temperature=0.7,
-                            max_tokens=150
-                        )
-                        assistant_message = response.choices[0].message.content
+                        # Process message and generate response
+                        answer = None
+                        if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
+                            meeting_details = await extract_meeting_details(audio_text)
+                            if meeting_details:
+                                result = await schedule_meeting(meeting_details)
+                                answer = result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
+                            else:
+                                answer = "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
+                        else:
+                            answer = await query_knowledge_base(audio_text)
+                        
+                        # Add assistant's response to messages
+                        messages.append({"role": "assistant", "content": answer})
+                        
+                        # Use Chat API as fallback if needed
+                        if not answer or answer.startswith("I couldn't find"):
+                            response = openai_client.chat.completions.create(
+                                model=settings.openai_model,
+                                messages=messages,
+                                temperature=0.7,
+                                max_tokens=150
+                            )
+                            assistant_message = response.choices[0].message.content
+                        else:
+                            assistant_message = answer
+                        
+                        # Convert to speech and send
                         speech_response = openai_client.audio.speech.create(
                             model="tts-1",
                             voice=settings.openai_voice,
@@ -394,6 +514,7 @@ async def media_stream(websocket: WebSocket):
                             response_format="mp3",
                             speed=1.0
                         )
+                        
                         await websocket.send_json({
                             "event": "media",
                             "media": {
@@ -402,7 +523,26 @@ async def media_stream(websocket: WebSocket):
                         })
                     except Exception as e:
                         logger.error(f"Error generating or sending response: {e}")
-                        continue
+                        # Send fallback message if there's an error
+                        try:
+                            fallback_message = "I'm sorry, I'm having trouble processing that right now. Could you please try again?"
+                            speech_response = openai_client.audio.speech.create(
+                                model="tts-1",
+                                voice=settings.openai_voice,
+                                input=fallback_message,
+                                response_format="mp3",
+                                speed=1.0
+                            )
+                            
+                            await websocket.send_json({
+                                "event": "media",
+                                "media": {
+                                    "payload": base64.b64encode(speech_response.content).decode()
+                                }
+                            })
+                        except Exception as e2:
+                            logger.error(f"Error sending fallback message: {e2}")
+                        
                 elif data.get("event") == "stop":
                     await save_transcript_summary(session_id, session["transcript"])
                     break
