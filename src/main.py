@@ -234,41 +234,40 @@ async def incoming_call(request: Request) -> Response:
 async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
     await websocket.accept()
+    session_id = None
     try:
-        # Read initial JSON handshake to get sessionId
-        handshake = await websocket.receive_json()
-        logger.info(f"WebSocket handshake received: {handshake}")
-        session_id = handshake.get("sessionId")
+        # 1. Wait for 'connected' event from Twilio
+        msg = await websocket.receive_json()
+        logger.info(f"Twilio event received: {msg}")
+        if msg.get("event") != "connected":
+            logger.error("Expected 'connected' event as first message")
+            await websocket.close()
+            return
+
+        # 2. Wait for 'start' event, extract sessionId from parameters
+        msg = await websocket.receive_json()
+        logger.info(f"Twilio event received: {msg}")
+        if msg.get("event") == "start":
+            parameters = msg.get("start", {}).get("parameters", {})
+            session_id = parameters.get("sessionId")
+            logger.info(f"Extracted sessionId from Twilio: {session_id}")
+        else:
+            logger.error("Expected 'start' event as second message")
+            await websocket.close()
+            return
+
         if not session_id or session_id not in sessions:
             logger.error(f"Invalid or missing sessionId: {session_id}")
-            try:
-                await websocket.close()
-            except RuntimeError:
-                pass  # Already closed
-            return  # Critical: stop further processing
+            await websocket.close()
+            return
+
         session = sessions[session_id]
-        
         # Initialize OpenAI conversation
         messages = [
             {
                 "role": "system",
-                "content": """You are a friendly and professional voice AI assistant. Your name is Alex. 
-                You are speaking to users over the phone, so keep your responses natural and conversational.
-                
-                Guidelines:
-                1. Be friendly but professional
-                2. Keep responses concise but informative
-                3. If you don't know something, say so
-                4. For scheduling meetings, ask for: name, email, purpose, date/time, and location
-                5. Use natural pauses and conversational markers like "um", "let me see", etc.
-                6. If the user is unclear, ask clarifying questions
-                7. End conversations naturally when appropriate
-                
-                Remember you're having a real-time conversation, so:
-                - Don't use markdown or special formatting
-                - Don't list items with numbers unless speaking them out
-                - Use natural speech patterns
-                - Keep responses brief but complete"""
+                "content": """You are a friendly and professional voice AI assistant. Your name is Alex. \
+                You are speaking to users over the phone, so keep your responses natural and conversational.\n\n                Guidelines:\n                1. Be friendly but professional\n                2. Keep responses concise but informative\n                3. If you don't know something, say so\n                4. For scheduling meetings, ask for: name, email, purpose, date/time, and location\n                5. Use natural pauses and conversational markers like 'um', 'let me see', etc.\n                6. If the user is unclear, ask clarifying questions\n                7. End conversations naturally when appropriate\n\n                Remember you're having a real-time conversation, so:\n                - Don't use markdown or special formatting\n                - Don't list items with numbers unless speaking them out\n                - Use natural speech patterns\n                - Keep responses brief but complete"""
             },
             {
                 "role": "assistant",
@@ -279,20 +278,16 @@ async def media_stream(websocket: WebSocket):
         # Main conversation loop
         while True:
             try:
-                # Receive audio data from Twilio
                 data = await websocket.receive_json()
                 if data.get("event") == "media":
                     audio_data = data.get("media", {}).get("payload")
-                    
                     if not audio_data:
                         logger.warning("Received media event without payload")
                         continue
-                        
                     try:
-                        # Convert audio to text using OpenAI
                         audio_bytes = base64.b64decode(audio_data)
                         audio_file = io.BytesIO(audio_bytes)
-                        audio_file.name = "audio.wav"  # Whisper expects a filename
+                        audio_file.name = "audio.wav"
                         audio_text = openai_client.audio.transcriptions.create(
                             model="whisper-1",
                             file=audio_file
@@ -300,26 +295,16 @@ async def media_stream(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"Error transcribing audio: {e}")
                         continue
-                        
-                    # Add to transcript
                     session["transcript"] += f"\nUser: {audio_text}"
-                    
-                    # Add to conversation
                     messages.append({"role": "user", "content": audio_text})
-                    
-                    # Check for conversation end
                     if any(phrase in audio_text.lower() for phrase in ["goodbye", "bye", "thanks", "thank you"]):
                         messages.append({
                             "role": "assistant",
                             "content": "You're welcome! Have a great day!"
                         })
-                        # Save transcript and summary to N8N
                         await save_transcript_summary(session_id, session["transcript"])
                         break
-                    
-                    # Check if user wants to schedule a meeting
                     if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
-                        # Extract meeting details using OpenAI
                         meeting_details = await extract_meeting_details(audio_text)
                         if meeting_details:
                             result = await schedule_meeting(meeting_details)
@@ -333,31 +318,23 @@ async def media_stream(websocket: WebSocket):
                                 "content": "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
                             })
                     else:
-                        # Query knowledge base for answers
                         answer = await query_knowledge_base(audio_text)
                         messages.append({"role": "assistant", "content": answer})
-                    
                     try:
-                        # Generate response using OpenAI
                         response = openai_client.chat.completions.create(
                             model=settings.openai_model,
                             messages=messages,
                             temperature=0.7,
-                            max_tokens=150  # Keep responses concise
+                            max_tokens=150
                         )
-                        
                         assistant_message = response.choices[0].message.content
-                        
-                        # Convert text to speech with appropriate voice settings
                         speech_response = openai_client.audio.speech.create(
                             model="tts-1",
                             voice=settings.openai_voice,
                             input=assistant_message,
                             response_format="mp3",
-                            speed=1.0  # Natural speaking speed
+                            speed=1.0
                         )
-                        
-                        # Send audio back to Twilio
                         await websocket.send_json({
                             "event": "media",
                             "media": {
@@ -367,26 +344,19 @@ async def media_stream(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"Error generating or sending response: {e}")
                         continue
-                        
                 elif data.get("event") == "stop":
-                    # Save transcript and summary to N8N
                     await save_transcript_summary(session_id, session["transcript"])
                     break
-                    
             except Exception as e:
                 logger.error(f"Error in conversation loop: {e}")
                 break
-                
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected cleanly.")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         try:
             await websocket.close()
         except RuntimeError:
-            pass  # Already closed
+            pass
     finally:
-        # Only close if not already closed
         try:
             await websocket.close()
         except RuntimeError:
