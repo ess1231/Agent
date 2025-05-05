@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -20,38 +21,31 @@ logger = logging.getLogger(__name__)
 
 # Define settings using Pydantic
 class Settings(BaseSettings):
-    # UltraVox settings
-    ultravox_api_key: str = os.getenv("ULTRAVOX_API_KEY", "")
-    ultravox_model: str = os.getenv("ULTRAVOX_MODEL", "fixie-ai/ultravox-70B")
-    ultravox_voice: str = os.getenv("ULTRAVOX_VOICE", "Tanya-English")
-    ultravox_sample_rate: int = int(os.getenv("ULTRAVOX_SAMPLE_RATE", "8000"))
-    ultravox_buffer_size: int = int(os.getenv("ULTRAVOX_BUFFER_SIZE", "60"))
+    # OpenAI settings
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+    openai_voice: str = os.getenv("OPENAI_VOICE", "alloy")
+    
+    # Pinecone settings
+    pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
+    pinecone_environment: str = os.getenv("PINECONE_ENVIRONMENT", "")
+    pinecone_index_name: str = os.getenv("PINECONE_INDEX_NAME", "")
     
     # Other settings
-    pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "")
-    ultravox_public_url: str = os.getenv("ULTRAVOX_PUBLIC_URL", "")
     port: int = int(os.getenv("PORT", "8080"))
 
 settings = Settings()
 
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=settings.openai_api_key)
+
+# Initialize Pinecone client
+pinecone = Pinecone(api_key=settings.pinecone_api_key)
+pinecone_index = pinecone.Index(settings.pinecone_index_name)
+
 # Session store to track ongoing calls
 sessions: Dict[str, Dict] = {}
-
-# Initialize Pinecone client lazily
-_pinecone_client = None
-_pinecone_index = None
-
-def get_pinecone_index():
-    global _pinecone_client, _pinecone_index
-    if _pinecone_client is None:
-        try:
-            _pinecone_client = Pinecone(api_key=settings.pinecone_api_key)
-            _pinecone_index = _pinecone_client.Index("voice-agent")  # Change to your actual index name
-        except Exception as e:
-            logger.error(f"Failed to initialize Pinecone: {e}")
-            return None
-    return _pinecone_index
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -61,106 +55,68 @@ def format_phone_number(number: str) -> str:
     """Format phone number by removing the plus sign and any non-digit characters."""
     return ''.join(filter(str.isdigit, number))
 
-# Helper function to create UltraVox call
-async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.ultravox.ai/api/calls",
-            headers={"X-API-Key": settings.ultravox_api_key},
-            json={
-                "systemPrompt": system_prompt,
-                "model": settings.ultravox_model,
-                "voice": settings.ultravox_voice,
-                "temperature": 0.1,
-                "initialMessages": [
-                    {"role": "MESSAGE_ROLE_USER", "text": first_message}
-                ],
-                "medium": {
-                    "serverWebSocket": {
-                        "inputSampleRate": settings.ultravox_sample_rate,
-                        "outputSampleRate": settings.ultravox_sample_rate,
-                        "clientBufferSizeMs": settings.ultravox_buffer_size
-                    }
-                },
-                "selectedTools": [
-                    {
-                        "toolName": "question_and_answer"
-                    },
-                    {
-                        "toolName": "schedule_meeting"
-                    }
-                ]
-            }
-        )
-        if response.status_code != 200:
-            logger.error(f"UltraVox API error {response.status_code}: {response.text}")
-            return None
-        return response.json().get("joinUrl")
-
-# Helper function to send requests to N8N
-async def send_to_n8n(route: str, number: str, payload: Optional[Dict] = None) -> Dict:
-    async with httpx.AsyncClient() as client:
-        data = {"route": route, "number": format_phone_number(number)}
-        if payload:
-            data["payload"] = payload
-        response = await client.post(settings.n8n_webhook_url, json=data)
-        return response.json()
-
-# Helper function to query Pinecone
-async def query_pinecone(question: str) -> str:
-    index = get_pinecone_index()
-    if index is None:
-        logger.warning("Pinecone index not available, returning mock response")
-        return f"Here's what I found about '{question}' in our knowledge base..."
+# Helper function to query knowledge base
+async def query_knowledge_base(question: str) -> str:
+    """Query the Pinecone knowledge base for relevant information."""
     try:
-        # Use the latest Pinecone search API
-        results = index.search(
-            namespace="default",  # Change if you use a different namespace
-            query={
-                "top_k": 3,
-                "inputs": {
-                    "text": question
-                }
-            }
-        )
-        hits = results.get('result', {}).get('hits', [])
-        if not hits:
-            return "Sorry, I couldn't find anything relevant in the knowledge base."
-        # Return the top result's text
-        return hits[0]['fields']['chunk_text']
-    except Exception as e:
-        logger.error(f"Error querying Pinecone: {e}")
-        return "I'm sorry, I couldn't access the knowledge base at the moment."
+        # Generate embedding for the question
+        embedding = openai_client.embeddings.create(
+            input=question,
+            model="text-embedding-3-small"
+        ).data[0].embedding
 
-# Helper function to summarize transcript
-async def summarize_transcript(transcript: str) -> str:
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.ultravox.ai/api/calls",
-            headers={"X-API-Key": settings.ultravox_api_key},
-            json={
-                "model": settings.ultravox_model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that summarizes phone call transcripts into concise bullet points."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Here is the full transcript of the call:\n\n{transcript}\n\nPlease give me a concise bullet-point summary."
-                    }
-                ],
-                "temperature": 0.7
-            }
+        # Query Pinecone
+        results = pinecone_index.query(
+            vector=embedding,
+            top_k=3,
+            include_metadata=True
         )
-        return response.json()["choices"][0]["message"]["content"]
+
+        # Process results
+        if not results.matches:
+            return "I couldn't find any relevant information in the knowledge base."
+
+        # Format the response
+        context = "\n".join([match.metadata.get('text', '') for match in results.matches])
+        
+        # Use OpenAI to generate a response based on the context
+        response = openai_client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the question. If the context doesn't contain relevant information, say so."},
+                {"role": "user", "content": f"Context: {context}\n\nQuestion: {question}"}
+            ],
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+
+    except Exception as e:
+        logger.error(f"Error querying knowledge base: {e}")
+        return "I'm sorry, I encountered an error while searching the knowledge base."
+
+# Helper function to schedule meeting
+async def schedule_meeting(meeting_details: Dict) -> Dict:
+    """Schedule a meeting using N8N."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                settings.n8n_webhook_url,
+                json={
+                    "route": "schedule_meeting",
+                    "details": meeting_details
+                }
+            )
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error scheduling meeting: {e}")
+        return {"error": "Failed to schedule meeting"}
 
 # Incoming call endpoint
 @app.post("/incoming-call")
 async def incoming_call(request: Request) -> Response:
     try:
         form_data = await request.form()
-        # Try both Caller and From parameters
         caller = form_data.get("From") or form_data.get("Caller")
         if not caller:
             logger.error("No caller number provided")
@@ -170,13 +126,17 @@ async def incoming_call(request: Request) -> Response:
 
         # Create a session
         session_id = f"session_{format_phone_number(caller)}"
-        sessions[session_id] = {"caller": caller, "first_message": "Hello! How can I help you today?"}
+        sessions[session_id] = {
+            "caller": caller,
+            "transcript": "",
+            "first_message": "Hello! How can I help you today?"
+        }
 
         # Generate TwiML to connect to media stream
         twiml = f"""
         <Response>
             <Connect>
-                <Stream url="wss://{settings.ultravox_public_url}/media-stream">
+                <Stream url="wss://{request.base_url.hostname}/media-stream">
                     <Parameter name="sessionId" value="{session_id}"/>
                 </Stream>
             </Connect>
@@ -192,115 +152,155 @@ async def incoming_call(request: Request) -> Response:
 async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
     await websocket.accept()
+    
     try:
         # Read initial JSON handshake to get sessionId
         handshake = await websocket.receive_json()
         logger.info(f"WebSocket handshake received: {handshake}")
         session_id = handshake.get("sessionId")
+        
         if not session_id or session_id not in sessions:
             logger.error(f"Invalid or missing sessionId: {session_id}")
             await websocket.close()
             return
 
         session = sessions[session_id]
-        caller = session["caller"]
         
-        # Initialize transcript in session
-        session["transcript"] = ""
+        # Initialize OpenAI conversation
+        messages = [
+            {
+                "role": "system",
+                "content": """You are a friendly and professional voice AI assistant. Your name is Alex. 
+                You are speaking to users over the phone, so keep your responses natural and conversational.
+                
+                Guidelines:
+                1. Be friendly but professional
+                2. Keep responses concise but informative
+                3. If you don't know something, say so
+                4. For scheduling meetings, ask for: name, email, purpose, date/time, and location
+                5. Use natural pauses and conversational markers like "um", "let me see", etc.
+                6. If the user is unclear, ask clarifying questions
+                7. End conversations naturally when appropriate
+                
+                Remember you're having a real-time conversation, so:
+                - Don't use markdown or special formatting
+                - Don't list items with numbers unless speaking them out
+                - Use natural speech patterns
+                - Keep responses brief but complete"""
+            },
+            {
+                "role": "assistant",
+                "content": "Hello! This is Alex. How can I help you today?"
+            }
+        ]
 
-        # Create UltraVox call and get join URL
-        system_prompt = "You are a helpful voice assistant. Answer questions and help schedule meetings."
-        join_url = await create_ultravox_call(system_prompt, session["first_message"])
-        if not join_url:
-            logger.error("Failed to get joinUrl from UltraVox. Closing WebSocket.")
-            await websocket.close()
-            return
-        # Connect to UltraVox WebSocket
-        ultravox_ws = await websockets.connect(join_url)
-
-        # Bidirectional relay loop
-        async def relay_twilio_to_ultravox():
-            while True:
-                try:
-                    data = await websocket.receive_json()
-                    if data.get("event") == "media":
-                        media_payload = data.get("media", {}).get("payload")
-                        if media_payload:
-                            # Forward audio to UltraVox
-                            await ultravox_ws.send(json.dumps({
-                                "type": "input.audio",
-                                "payload": media_payload
-                            }))
-                    elif data.get("event") == "stop":
-                        # Handle stop event
-                        transcript = session.get("transcript", "")
-                        if transcript:
-                            summary = await summarize_transcript(transcript)
-                            await send_to_n8n("2", caller, {
-                                "transcript": transcript,
-                                "summary": summary
+        # Main conversation loop
+        while True:
+            try:
+                # Receive audio data from Twilio
+                data = await websocket.receive_json()
+                if data.get("event") == "media":
+                    audio_data = data.get("media", {}).get("payload")
+                    
+                    if audio_data:
+                        # Convert audio to text using OpenAI
+                        audio_text = openai_client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_data
+                        ).text
+                        
+                        # Add to transcript
+                        session["transcript"] += f"\nUser: {audio_text}"
+                        
+                        # Add to conversation
+                        messages.append({"role": "user", "content": audio_text})
+                        
+                        # Check for conversation end
+                        if any(phrase in audio_text.lower() for phrase in ["goodbye", "bye", "thanks", "thank you"]):
+                            messages.append({
+                                "role": "assistant",
+                                "content": "You're welcome! Have a great day!"
                             })
-                        break
-                except Exception as e:
-                    logger.error(f"Error relaying Twilio to UltraVox: {e}")
+                            break
+                        
+                        # Check if user wants to schedule a meeting
+                        if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
+                            # Extract meeting details using OpenAI
+                            meeting_details = await extract_meeting_details(audio_text)
+                            if meeting_details:
+                                result = await schedule_meeting(meeting_details)
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
+                                })
+                            else:
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
+                                })
+                        else:
+                            # Query knowledge base for answers
+                            answer = await query_knowledge_base(audio_text)
+                            messages.append({"role": "assistant", "content": answer})
+                        
+                        # Generate response using OpenAI
+                        response = openai_client.chat.completions.create(
+                            model=settings.openai_model,
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=150  # Keep responses concise
+                        )
+                        
+                        assistant_message = response.choices[0].message.content
+                        
+                        # Convert text to speech with appropriate voice settings
+                        speech_response = openai_client.audio.speech.create(
+                            model="tts-1",
+                            voice=settings.openai_voice,
+                            input=assistant_message,
+                            response_format="mp3",
+                            speed=1.0  # Natural speaking speed
+                        )
+                        
+                        # Send audio back to Twilio
+                        await websocket.send_json({
+                            "event": "media",
+                            "media": {
+                                "payload": base64.b64encode(speech_response.content).decode()
+                            }
+                        })
+                        
+                elif data.get("event") == "stop":
                     break
-
-        async def relay_ultravox_to_twilio():
-            while True:
-                try:
-                    data = await ultravox_ws.recv()
-                    event = json.loads(data)
-                    if "response" in event:
-                        if "audio" in event["response"] and "delta" in event["response"]["audio"]:
-                            # Forward audio to Twilio
-                            await websocket.send_json({
-                                "event": "media",
-                                "media": {"payload": event["response"]["audio"]["delta"]}
-                            })
-                        elif "text" in event["response"] and "delta" in event["response"]["text"]:
-                            # Accumulate transcript
-                            session["transcript"] += event["response"]["text"]["delta"]
-                        elif "function_call_arguments" in event["response"] and event["response"]["function_call_arguments"].get("done"):
-                            # Handle function call
-                            func_name = event["response"]["function_call_arguments"].get("name")
-                            args = event["response"]["function_call_arguments"].get("arguments", {})
-                            if func_name == "question_and_answer":
-                                # Use Pinecone for Q&A
-                                answer = await query_pinecone(args.get("question", ""))
-                                await ultravox_ws.send(json.dumps({
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "function_call_output",
-                                        "role": "system",
-                                        "output": answer
-                                    }
-                                }))
-                                await ultravox_ws.send(json.dumps({"type": "response.create"}))
-                            elif func_name == "schedule_meeting":
-                                # Use N8N for booking
-                                result = await send_to_n8n("3", caller, args)
-                                await ultravox_ws.send(json.dumps({
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "function_call_output",
-                                        "role": "system",
-                                        "output": result.get("message", "Meeting scheduled successfully.")
-                                    }
-                                }))
-                                await ultravox_ws.send(json.dumps({"type": "response.create"}))
-                except Exception as e:
-                    logger.error(f"Error relaying UltraVox to Twilio: {e}")
-                    break
-
-        # Run both relay tasks concurrently
-        await asyncio.gather(relay_twilio_to_ultravox(), relay_ultravox_to_twilio())
-
+                    
+            except Exception as e:
+                logger.error(f"Error in conversation loop: {e}")
+                break
+                
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
         await websocket.close()
-        if 'ultravox_ws' in locals():
-            await ultravox_ws.close()
+
+# Helper function to extract meeting details
+async def extract_meeting_details(text: str) -> Optional[Dict]:
+    """Extract meeting details from user's speech using OpenAI."""
+    try:
+        response = openai_client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[
+                {"role": "system", "content": "Extract meeting details from the text. Return only the details in JSON format."},
+                {"role": "user", "content": text}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        details = json.loads(response.choices[0].message.content)
+        return details if all(k in details for k in ["name", "email", "purpose", "datetime", "location"]) else None
+        
+    except Exception as e:
+        logger.error(f"Error extracting meeting details: {e}")
+        return None
 
 # Root endpoint for health check
 @app.get("/")
