@@ -207,10 +207,12 @@ async def incoming_call(request: Request) -> Response:
 # Media stream WebSocket handler
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
+    logger.info("WebSocket connection attempt received")
     await websocket.accept()
     try:
         # Read initial JSON handshake to get sessionId
         handshake = await websocket.receive_json()
+        logger.info(f"WebSocket handshake received: {handshake}")
         session_id = handshake.get("sessionId")
         if not session_id or session_id not in sessions:
             logger.error(f"Invalid or missing sessionId: {session_id}")
