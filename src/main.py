@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "")
     repl_public_url: str = os.getenv("REPL_PUBLIC_URL", "")
-    port: int = int(os.getenv("PORT", "8000"))
+    port: int = int(os.getenv("PORT", "8080"))
 
 settings = Settings()
 
