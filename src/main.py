@@ -84,28 +84,10 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
                 },
                 "selectedTools": [
                     {
-                        "toolName": "question_and_answer",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "question": {"type": "string", "description": "The question to answer"}
-                            },
-                            "required": ["question"]
-                        }
+                        "toolName": "question_and_answer"
                     },
                     {
-                        "toolName": "schedule_meeting",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string", "description": "Name of the attendee"},
-                                "email": {"type": "string", "description": "Email of the attendee"},
-                                "purpose": {"type": "string", "description": "Purpose of the meeting"},
-                                "datetime": {"type": "string", "description": "Date and time of the meeting"},
-                                "location": {"type": "string", "description": "Location of the meeting"}
-                            },
-                            "required": ["name", "email", "purpose", "datetime", "location"]
-                        }
+                        "toolName": "schedule_meeting"
                     }
                 ]
             }
