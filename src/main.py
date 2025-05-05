@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from pinecone import Pinecone
 from openai import OpenAI
 from datetime import datetime
+import io
 
 # Load environment variables
 load_dotenv()
@@ -289,9 +290,12 @@ async def media_stream(websocket: WebSocket):
                         
                     try:
                         # Convert audio to text using OpenAI
+                        audio_bytes = base64.b64decode(audio_data)
+                        audio_file = io.BytesIO(audio_bytes)
+                        audio_file.name = "audio.wav"  # Whisper expects a filename
                         audio_text = openai_client.audio.transcriptions.create(
                             model="whisper-1",
-                            file=audio_data
+                            file=audio_file
                         ).text
                     except Exception as e:
                         logger.error(f"Error transcribing audio: {e}")
