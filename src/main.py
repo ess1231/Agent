@@ -175,29 +175,34 @@ async def summarize_transcript(transcript: str) -> str:
 # Incoming call endpoint
 @app.post("/incoming-call")
 async def incoming_call(request: Request) -> Response:
-    form_data = await request.form()
-    caller = form_data.get("From")
-    logger.info(f"Incoming call from {caller}")
+    try:
+        form_data = await request.form()
+        # Try both Caller and From parameters
+        caller = form_data.get("From") or form_data.get("Caller")
+        if not caller:
+            logger.error("No caller number provided")
+            return Response(content="<Response><Reject/></Response>", media_type="text/xml")
+            
+        logger.info(f"Incoming call from {caller}")
 
-    # Fetch chat history from N8N (route 1)
-    history = await send_to_n8n("1", caller)
-    first_message = history.get("firstMessage", "Hello! How can I help you today?")
+        # Create a session
+        session_id = f"session_{format_phone_number(caller)}"
+        sessions[session_id] = {"caller": caller, "first_message": "Hello! How can I help you today?"}
 
-    # Create a session
-    session_id = f"session_{format_phone_number(caller)}"
-    sessions[session_id] = {"caller": caller, "first_message": first_message}
-
-    # Generate TwiML to connect to media stream
-    twiml = f"""
-    <Response>
-        <Connect>
-            <Stream url="wss://{settings.ultravox_public_url}/media-stream">
-                <Parameter name="sessionId" value="{session_id}"/>
-            </Stream>
-        </Connect>
-    </Response>
-    """
-    return Response(content=twiml, media_type="text/xml")
+        # Generate TwiML to connect to media stream
+        twiml = f"""
+        <Response>
+            <Connect>
+                <Stream url="wss://{settings.ultravox_public_url}/media-stream">
+                    <Parameter name="sessionId" value="{session_id}"/>
+                </Stream>
+            </Connect>
+        </Response>
+        """
+        return Response(content=twiml, media_type="text/xml")
+    except Exception as e:
+        logger.error(f"Error handling incoming call: {str(e)}")
+        return Response(content="<Response><Reject/></Response>", media_type="text/xml")
 
 # Media stream WebSocket handler
 @app.websocket("/media-stream")
