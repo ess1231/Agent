@@ -52,9 +52,18 @@ except Exception as e:
 
 # Initialize Pinecone client
 try:
+    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+    pinecone_env = os.getenv("PINECONE_ENVIRONMENT")
+    
+    if not pinecone_api_key:
+        raise RuntimeError("PINECONE_API_KEY is not set")
+    if not pinecone_env:
+        raise RuntimeError("PINECONE_ENVIRONMENT is not set")
+        
+    logger.info(f"Initializing Pinecone with environment: {pinecone_env}")
     pinecone = Pinecone(
-        api_key=settings.pinecone_api_key,
-        environment=settings.pinecone_environment
+        api_key=pinecone_api_key,
+        environment=pinecone_env
     )
     pinecone_index = pinecone.Index(name="voice-agent")
     logger.info(f"Successfully connected to Pinecone index: voice-agent")
