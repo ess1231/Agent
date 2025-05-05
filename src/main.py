@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # Other settings
     pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "")
-    repl_public_url: str = os.getenv("REPL_PUBLIC_URL", "")
+    ultravox_public_url: str = os.getenv("ULTRAVOX_PUBLIC_URL", "")
     port: int = int(os.getenv("PORT", "8080"))
 
 settings = Settings()
@@ -191,7 +191,7 @@ async def incoming_call(request: Request) -> Response:
     twiml = f"""
     <Response>
         <Connect>
-            <Stream url="wss://{settings.repl_public_url}/media-stream">
+            <Stream url="wss://{settings.ultravox_public_url}/media-stream">
                 <Parameter name="sessionId" value="{session_id}"/>
             </Stream>
         </Connect>
