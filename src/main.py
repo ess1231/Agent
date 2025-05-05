@@ -85,7 +85,6 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
                 "selectedTools": [
                     {
                         "toolName": "question_and_answer",
-                        "description": "Answer a question using the knowledge base.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -96,7 +95,6 @@ async def create_ultravox_call(system_prompt: str, first_message: str) -> str:
                     },
                     {
                         "toolName": "schedule_meeting",
-                        "description": "Schedule a meeting.",
                         "parameters": {
                             "type": "object",
                             "properties": {
