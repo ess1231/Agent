@@ -263,9 +263,9 @@ def convert_mulaw_to_wav(mulaw_data, sample_rate=8000, channels=1):
 
 # Buffer to accumulate audio data
 class AudioBuffer:
-    def __init__(self, min_length=8000):
+    def __init__(self, min_length=16000):  # Increase to 2 seconds at 8kHz
         self.buffer = bytearray()
-        self.min_length = min_length  # Minimum length for processing (1 second)
+        self.min_length = min_length  # Minimum length for processing (2 seconds)
         
     def add_data(self, data):
         """Add data to the buffer, return True if buffer exceeds minimum length"""
@@ -309,15 +309,18 @@ async def incoming_call(request: Request) -> Response:
         }
 
         # Generate TwiML to connect to media stream using domain from settings
+        # Add track attribute to make sure audio is bidirectional
         twiml = f"""
         <Response>
             <Connect>
-                <Stream url="wss://{settings.domain}/media-stream">
+                <Stream url="wss://{settings.domain}/media-stream" track="both">
                     <Parameter name="sessionId" value="{session_id}"/>
                 </Stream>
             </Connect>
+            <Say>If you cannot hear the assistant, please wait a moment.</Say>
         </Response>
         """
+        logger.info(f"Returning TwiML: {twiml}")
         return Response(content=twiml, media_type="text/xml")
     except Exception as e:
         logger.error(f"Error handling incoming call: {str(e)}")
@@ -446,7 +449,7 @@ async def media_stream(websocket: WebSocket):
         ]
         
         # Initialize audio buffer for accumulating short audio chunks
-        audio_buffer = AudioBuffer(min_length=8000)  # 1 second at 8kHz
+        audio_buffer = AudioBuffer(min_length=16000)  # 2 seconds at 8kHz
         
         # IMPORTANT: Immediately send the welcome message
         try:
@@ -461,14 +464,20 @@ async def media_stream(websocket: WebSocket):
                 speed=1.0
             )
             
+            logger.info(f"Generated audio of size: {len(speech_response.content)} bytes")
+            
             # Send welcome audio to Twilio
             try:
                 # Check if connection is still open
                 if connection_open:
+                    payload = base64.b64encode(speech_response.content).decode()
+                    logger.info(f"Encoded audio to base64, size: {len(payload)}")
+                    
                     await websocket.send_json({
                         "event": "media",
                         "media": {
-                            "payload": base64.b64encode(speech_response.content).decode()
+                            "payload": payload,
+                            "track": "outbound"  # Add track parameter to specify direction
                         }
                     })
                     logger.info("Welcome message sent successfully")
@@ -585,10 +594,12 @@ async def media_stream(websocket: WebSocket):
                             
                             # Check if connection is still open
                             if connection_open:
+                                payload = base64.b64encode(speech_response.content).decode()
                                 await websocket.send_json({
                                     "event": "media",
                                     "media": {
-                                        "payload": base64.b64encode(speech_response.content).decode()
+                                        "payload": payload,
+                                        "track": "outbound"  # Add track parameter to specify direction
                                     }
                                 })
                             else:
@@ -656,15 +667,22 @@ async def media_stream(websocket: WebSocket):
                             speed=1.0
                         )
                         
+                        logger.info(f"Generated response audio of size: {len(speech_response.content)} bytes for message: {assistant_message[:30]}...")
+                        
                         try:
                             # Check if connection is still open
                             if connection_open:
+                                payload = base64.b64encode(speech_response.content).decode()
+                                logger.info(f"Encoded response audio to base64, sending {len(payload)} bytes")
+                                
                                 await websocket.send_json({
                                     "event": "media",
                                     "media": {
-                                        "payload": base64.b64encode(speech_response.content).decode()
+                                        "payload": payload,
+                                        "track": "outbound"  # Add track parameter to specify direction
                                     }
                                 })
+                                logger.info("Response audio sent successfully")
                             else:
                                 logger.warning("Cannot send response - connection closed")
                                 break
@@ -691,7 +709,8 @@ async def media_stream(websocket: WebSocket):
                                 await websocket.send_json({
                                     "event": "media",
                                     "media": {
-                                        "payload": base64.b64encode(speech_response.content).decode()
+                                        "payload": base64.b64encode(speech_response.content).decode(),
+                                        "track": "outbound"  # Add track parameter to specify direction
                                     }
                                 })
                             else:
