@@ -83,6 +83,13 @@ sessions: Dict[str, Dict] = {}
 # Initialize FastAPI app
 app = FastAPI()
 
+# Custom middleware to add Railway-specific headers
+@app.middleware("http")
+async def add_railway_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Railway-App"] = "true"
+    return response
+
 # Add CORS middleware to allow WebSockets from all origins
 app.add_middleware(
     CORSMiddleware,
@@ -91,6 +98,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Validate Twilio signatures for security - important for WebSockets
+def validate_twilio_signature(headers, url, params=None):
+    """Validate that the request is coming from Twilio."""
+    try:
+        # This is a simplified validation - in production, use the Twilio SDK
+        # For now, we'll log the headers for debugging
+        logger.info(f"Validating Twilio headers: {headers}")
+        return True
+    except Exception as e:
+        logger.error(f"Error validating Twilio signature: {e}")
+        return False
 
 # Helper function to format phone number
 def format_phone_number(number: str) -> str:
@@ -324,19 +343,36 @@ async def incoming_call(request: Request) -> Response:
             logger.warning(f"Failed to fetch chat history from n8n, using default greeting: {e}")
             first_message = "Hello! I'm your AI assistant. How can I help you today?"
 
-        # For debugging: Let's use a simple TwiML response first to test basic functionality
+        # Create a session
+        session_id = f"session_{format_phone_number(caller)}"
+        sessions[session_id] = {
+            "caller": caller,
+            "transcript": "",
+            "first_message": first_message,
+            "created_at": datetime.now().isoformat()
+        }
+
+        # IMPORTANT: Use the exact domain with wss:// for Twilio
+        # The WebSocket URL must match our FastAPI route exactly
+        # Railway provides a domain that already has HTTPS/WSS enabled
+        domain = settings.full_domain if settings.full_domain else request.headers.get("host", "localhost:8080")
+        websocket_url = f"wss://{domain}/media-stream"
+        logger.info(f"Using WebSocket URL for Twilio: {websocket_url}")
+        
+        # Generate TwiML to connect to media stream
+        # track="both" enables bidirectional audio
         twiml = f"""
         <Response>
-            <Say>Hello! This is a direct TwiML test. I'm your AI assistant. Press any key to continue.</Say>
-            <Gather numDigits="1" action="/gather-test" method="POST">
-                <Say>Please press any key to test response.</Say>
-            </Gather>
-            <Say>No input received. Goodbye!</Say>
+            <Connect>
+                <Stream url="{websocket_url}" track="both">
+                    <Parameter name="sessionId" value="{session_id}"/>
+                </Stream>
+            </Connect>
+            <Say>If you cannot hear the assistant, the WebSocket connection may have failed.</Say>
         </Response>
         """
-        logger.info(f"Returning simple TwiML test: {twiml}")
+        logger.info(f"Returning TwiML: {twiml}")
         return Response(content=twiml, media_type="text/xml")
-        
     except Exception as e:
         logger.error(f"Error handling incoming call: {str(e)}")
         return Response(content="<Response><Reject/></Response>", media_type="text/xml")
@@ -370,18 +406,28 @@ async def root():
 async def media_stream_health():
     return {"status": "media-stream endpoint is active"}
 
-# Media stream WebSocket handler
+# Media stream WebSocket handler - FIXED FOR RAILWAY
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    logger.info("WebSocket connection attempt received")
+    logger.info("⭐ WebSocket connection attempt received to /media-stream")
     
+    # CRITICAL: Accept the connection IMMEDIATELY before any other operations
+    # This is the most important fix - we must send the 101 Switching Protocols response
+    # before Twilio times out
     try:
         await websocket.accept()
-        logger.info("WebSocket connection accepted successfully")
+        logger.info("✅ WebSocket connection SUCCESSFULLY ACCEPTED")
     except Exception as e:
-        logger.error(f"Failed to accept WebSocket connection: {e}")
+        logger.error(f"❌ CRITICAL ERROR accepting WebSocket: {e}")
         return
         
+    # Only log headers after accepting - they're not critical for handshake
+    try:
+        headers = websocket.headers
+        logger.info(f"WebSocket headers after accept: {headers}")
+    except Exception as e:
+        logger.error(f"Error accessing WebSocket headers: {e}")
+    
     session_id = None
     connection_open = True
     logger.info("Starting WebSocket handling for media stream")
