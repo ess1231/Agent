@@ -291,9 +291,13 @@ async def incoming_call(request: Request) -> Response:
             
         logger.info(f"Incoming call from {caller}")
 
-        # Fetch chat history and get first message
-        chat_history = await fetch_chat_history(caller)
-        first_message = chat_history.get("firstMessage", "Hello! How can I help you today?")
+        # Try to fetch chat history, but provide default if n8n fails
+        try:
+            chat_history = await fetch_chat_history(caller)
+            first_message = chat_history.get("firstMessage", "Hello! How can I help you today?")
+        except Exception as e:
+            logger.warning(f"Failed to fetch chat history from n8n, using default greeting: {e}")
+            first_message = "Hello! I'm your AI assistant. How can I help you today?"
 
         # Create a session
         session_id = f"session_{format_phone_number(caller)}"
@@ -325,6 +329,7 @@ async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
     await websocket.accept()
     session_id = None
+    connection_open = True
     
     try:
         # 1. Wait for 'connected' event from Twilio
@@ -412,7 +417,7 @@ async def media_stream(websocket: WebSocket):
         logger.info(f"Successfully found session: {session_id}")
         session = sessions[session_id]
         
-        # Initialize OpenAI conversation and audio buffer
+        # Initialize OpenAI conversation
         messages = [
             {
                 "role": "system",
@@ -458,34 +463,29 @@ async def media_stream(websocket: WebSocket):
             
             # Send welcome audio to Twilio
             try:
-                await websocket.send_json({
-                    "event": "media",
-                    "media": {
-                        "payload": base64.b64encode(speech_response.content).decode()
-                    }
-                })
-                logger.info("Welcome message sent successfully")
+                # Check if connection is still open
+                if connection_open:
+                    await websocket.send_json({
+                        "event": "media",
+                        "media": {
+                            "payload": base64.b64encode(speech_response.content).decode()
+                        }
+                    })
+                    logger.info("Welcome message sent successfully")
+                else:
+                    logger.warning("Cannot send welcome message - connection not open")
+                    return
             except Exception as e:
                 logger.error(f"WebSocket error sending welcome message: {e}")
-                if "WebSocket is not connected" in str(e):
-                    logger.warning("WebSocket disconnected, attempting to reconnect...")
-                    try:
-                        await websocket.accept()
-                        # Try sending again
-                        await websocket.send_json({
-                            "event": "media",
-                            "media": {
-                                "payload": base64.b64encode(speech_response.content).decode()
-                            }
-                        })
-                        logger.info("Welcome message sent after reconnection")
-                    except Exception as reconnect_error:
-                        logger.error(f"Failed to reconnect websocket: {reconnect_error}")
+                if "WebSocket is not connected" in str(e) or "Cannot call \"send\"" in str(e):
+                    logger.warning("WebSocket disconnected")
+                    connection_open = False
+                    return
         except Exception as e:
             logger.error(f"Error generating welcome message: {e}")
         
         # Main conversation loop
-        while True:
+        while connection_open:
             try:
                 # Set timeout for receiving data
                 try:
@@ -494,11 +494,16 @@ async def media_stream(websocket: WebSocket):
                     logger.warning("WebSocket receive timeout - no data received for 30 seconds")
                     # Send a ping to check connection
                     try:
-                        await websocket.send_json({"event": "ping"})
-                        logger.info("Ping sent to keep connection alive")
-                        continue
+                        if connection_open:
+                            await websocket.send_json({"event": "ping"})
+                            logger.info("Ping sent to keep connection alive")
+                            continue
+                        else:
+                            logger.warning("Connection no longer open")
+                            break
                     except Exception as ping_error:
                         logger.error(f"Failed to send ping, connection likely lost: {ping_error}")
+                        connection_open = False
                         break
                 
                 if data.get("event") == "media":
@@ -536,6 +541,7 @@ async def media_stream(websocket: WebSocket):
                                 model="whisper-1",
                                 file=audio_file
                             ).text
+                            
                             logger.info(f"Transcribed text: {audio_text}")
                         except Exception as e:
                             if "audio_too_short" in str(e):
@@ -577,44 +583,67 @@ async def media_stream(websocket: WebSocket):
                                 speed=1.0
                             )
                             
-                            await websocket.send_json({
-                                "event": "media",
-                                "media": {
-                                    "payload": base64.b64encode(speech_response.content).decode()
-                                }
-                            })
+                            # Check if connection is still open
+                            if connection_open:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "media": {
+                                        "payload": base64.b64encode(speech_response.content).decode()
+                                    }
+                                })
+                            else:
+                                logger.warning("Cannot send goodbye - connection closed")
                         except Exception as e:
                             logger.error(f"Error sending goodbye message: {e}")
+                            connection_open = False
                             
-                        # Save transcript
-                        await save_transcript_summary(session_id, session["transcript"])
+                        # Save transcript - but don't let n8n failure stop us
+                        try:
+                            await save_transcript_summary(session_id, session["transcript"])
+                        except Exception as e:
+                            logger.error(f"Error saving transcript: {e}")
+                            
                         break
                     
                     try:
                         # Process message and generate response
                         answer = None
+                        # Skip n8n calls if needed - respond directly from Pinecone
                         if "schedule" in audio_text.lower() or "meeting" in audio_text.lower():
-                            meeting_details = await extract_meeting_details(audio_text)
-                            if meeting_details:
-                                result = await schedule_meeting(meeting_details)
-                                answer = result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
-                            else:
-                                answer = "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
+                            try:
+                                meeting_details = await extract_meeting_details(audio_text)
+                                if meeting_details:
+                                    result = await schedule_meeting(meeting_details)
+                                    answer = result.get("message", "I've scheduled the meeting for you. Is there anything else I can help with?")
+                                else:
+                                    answer = "I'd be happy to schedule a meeting for you. Could you please provide your name, email, the purpose of the meeting, and your preferred date and time?"
+                            except Exception as e:
+                                logger.error(f"Error scheduling meeting: {e}")
+                                answer = "I'm sorry, I'm having trouble with the scheduling service right now. Could we try again in a moment?"
                         else:
-                            answer = await query_knowledge_base(audio_text)
+                            # Use Pinecone for Q&A
+                            try:
+                                answer = await query_knowledge_base(audio_text)
+                            except Exception as e:
+                                logger.error(f"Error querying knowledge base: {e}")
+                                answer = "I'm sorry, I'm having trouble accessing my knowledge base right now."
                         
                         # Add assistant's response to messages
                         messages.append({"role": "assistant", "content": answer})
                         
                         # Use Chat API as fallback if needed
                         if not answer or answer.startswith("I couldn't find"):
-                            response = openai_client.chat.completions.create(
-                                model=settings.openai_model,
-                                messages=messages,
-                                temperature=0.7,
-                                max_tokens=150
-                            )
-                            assistant_message = response.choices[0].message.content
+                            try:
+                                response = openai_client.chat.completions.create(
+                                    model=settings.openai_model,
+                                    messages=messages,
+                                    temperature=0.7,
+                                    max_tokens=150
+                                )
+                                assistant_message = response.choices[0].message.content
+                            except Exception as e:
+                                logger.error(f"Error with chat completion: {e}")
+                                assistant_message = "I'm sorry, I'm having trouble processing that right now. Could you please try again?"
                         else:
                             assistant_message = answer
                         
@@ -628,56 +657,84 @@ async def media_stream(websocket: WebSocket):
                         )
                         
                         try:
-                            await websocket.send_json({
-                                "event": "media",
-                                "media": {
-                                    "payload": base64.b64encode(speech_response.content).decode()
-                                }
-                            })
+                            # Check if connection is still open
+                            if connection_open:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "media": {
+                                        "payload": base64.b64encode(speech_response.content).decode()
+                                    }
+                                })
+                            else:
+                                logger.warning("Cannot send response - connection closed")
+                                break
                         except Exception as ws_error:
                             logger.error(f"Error sending audio response: {ws_error}")
                             if "WebSocket is not connected" in str(ws_error) or "Cannot call \"send\"" in str(ws_error):
                                 logger.warning("WebSocket connection lost, breaking conversation loop")
+                                connection_open = False
                                 break
                     except Exception as e:
                         logger.error(f"Error generating or sending response: {e}")
                         # Send fallback message if there's an error
                         try:
-                            fallback_message = "I'm sorry, I'm having trouble processing that right now. Could you please try again?"
-                            speech_response = openai_client.audio.speech.create(
-                                model="tts-1",
-                                voice=settings.openai_voice,
-                                input=fallback_message,
-                                response_format="mp3",
-                                speed=1.0
-                            )
-                            
-                            await websocket.send_json({
-                                "event": "media",
-                                "media": {
-                                    "payload": base64.b64encode(speech_response.content).decode()
-                                }
-                            })
+                            if connection_open:
+                                fallback_message = "I'm sorry, I'm having trouble processing that right now. Could you please try again?"
+                                speech_response = openai_client.audio.speech.create(
+                                    model="tts-1",
+                                    voice=settings.openai_voice,
+                                    input=fallback_message,
+                                    response_format="mp3",
+                                    speed=1.0
+                                )
+                                
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "media": {
+                                        "payload": base64.b64encode(speech_response.content).decode()
+                                    }
+                                })
+                            else:
+                                logger.warning("Cannot send fallback - connection closed")
+                                break
                         except Exception as e2:
                             logger.error(f"Error sending fallback message: {e2}")
+                            connection_open = False
                         
                 elif data.get("event") == "stop":
-                    await save_transcript_summary(session_id, session["transcript"])
+                    logger.info("Received stop event, ending call")
+                    try:
+                        await save_transcript_summary(session_id, session["transcript"])
+                    except Exception as e:
+                        logger.error(f"Error saving transcript on stop: {e}")
                     break
+                elif data.get("event") == "mark":
+                    # Handle mark events (related to recording)
+                    logger.info(f"Received mark event: {data}")
+                elif data.get("event") == "pong":
+                    # Handle pong response
+                    logger.info("Received pong from client")
+                else:
+                    logger.info(f"Received unknown event: {data.get('event')}")
+            except WebSocketDisconnect:
+                logger.warning("WebSocket disconnected")
+                connection_open = False
+                break
             except Exception as e:
                 logger.error(f"Error in conversation loop: {e}")
+                connection_open = False
                 break
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass
+        connection_open = False
     finally:
         try:
-            await websocket.close()
-        except RuntimeError:
-            pass
+            # Only try to close if not already closed
+            if connection_open:
+                await websocket.close()
+                logger.info("WebSocket closed cleanly")
+        except Exception as e:
+            logger.error(f"Error closing websocket: {e}")
 
 # Helper function to extract meeting details
 async def extract_meeting_details(text: str) -> Optional[Dict]:
