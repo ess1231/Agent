@@ -96,6 +96,179 @@ Error Handling & Timeouts
 Use timeouts for external calls
 Gracefully close WebSockets on disconnect
 Structured logging for debugging
+
+### N8N Workflow: Voice-AI Orchestrator
+
+The n8n workflow integrates with the FastAPI application via webhooks and handles chat history, transcripts, and meeting scheduling. The workflow is organized as follows:
+
+#### Entry Point: Single Webhook
+- **Node**: Webhook
+- **Type**: Webhook (POST)
+- **Path**: /webhook
+- **Behavior**: Accepts all incoming calls from the FastAPI app. Expects JSON with a top-level "route" key set to "1", "2", or "3", plus other fields depending on route.
+
+#### Router: Switch on route
+- **Node**: Switch route
+- **Type**: Switch
+- **Field Checked**: `{{$json["route"]}}`
+- **Branches**:
+  - Route 1 (== "1") → Fetch History
+  - Route 2 (== "2") → Save Transcript
+  - Route 3 (== "3") → Book Meeting
+
+#### Route 1: Fetch Prior Chat History
+1. **Google Sheets Lookup**
+   - **Node**: Lookup Sheet Row
+   - **Action**: Finds a row by number (caller's phone)
+   - **Returns**: name (if saved), plus any stored summary/transcript columns
+
+2. **Function: Build First Message**
+   - **Node**: Build Greeting
+   - **Code**:
+     ```javascript
+     const data = items[0].json;
+     const name = data.name;
+     const defaultMsg = "Hi, this is Julia speaking. How can I help you today?";
+     const firstMessage = name
+       ? `Hi, this is Julia speaking. ${name}, how can I help you today?`
+       : defaultMsg;
+     return [{ json: { firstMessage, callerNumber: data.number } }];
+     ```
+
+3. **Respond to Webhook**
+   - **Node**: Respond First Message
+   - **Type**: Respond to Webhook
+   - **Output**:
+     ```json
+     {
+       "firstMessage": "...",
+       "callerNumber": "..."
+     }
+     ```
+
+#### Route 2: Persist Call Transcript & Summary
+1. **Webhook (Save Transcript)**
+   - Accepts JSON `{ route:"2", number, transcript, summary? }`.
+
+2. **Optional LLM Summarization**
+   - **Node**: Summarize Call (OpenAI Chat)
+   - **Prompt**: "Summarize this transcript in one sentence: {{$json["transcript"]}}"
+   - **Output**: single-sentence summary
+
+3. **Google Sheets Append/Upsert**
+   - **Node**: Append Call History
+   - **Writes**:
+     - number → caller's phone
+     - transcript → full call text
+     - summary → either the incoming summary or the LLM's
+
+4. **Respond to Webhook**
+   - **Node**: Respond OK
+   - **Output**: `{ "status":"ok" }`
+
+#### Route 3: Book Meeting
+1. **3A. Normalize Incoming Payload**
+   - **Function: Format Date & Time**
+   - **Node**: Format Date & Time
+   - **Reads**:
+     ```javascript
+     const body = items[0].json.body || items[0].json;
+     const { name,email,purpose,datetime } = body.payload;
+     ```
+   - **Preserves** datetime as a UK-local string ("YYYY-MM-DDTHH:mm:ss")
+   - **Computes** an end time one hour later in the same format
+   - **Returns**:
+     ```json
+     {
+       "name", "email", "purpose",
+       "start":"2025-04-30T16:00:00",
+       "end":  "2025-04-30T17:00:00",
+       "number": body.number
+     }
+     ```
+
+2. **3B. Check Original Slot**
+   - **Google Calendar Get Events**
+   - **Node**: Check Slot
+   - **Calendar ID**: (your default)
+   - **Time Min**: `{{$node["Format Date & Time"].json.start}}`
+   - **Time Max**: `{{$node["Format Date & Time"].json.end}}`
+   - **Time Zone**: Europe/London (Advanced)
+   - **Max Results**: 1
+
+3. **IF: Is Original Free?**
+   - **Node**: If Original Free?
+   - **Condition**: `{{$node["Check Slot"].json.length === 0}}`
+   - **Keep Input Data**: Enabled
+
+4. **True Branch (Available)**
+   - **Google Calendar Create Event (Create Event)**
+   - **Summary**: Meeting: `{{$node["Format Date & Time"].json.purpose}}`
+   - **Start/End**: as above
+   - **Attendee**: `{{$node["Format Date & Time"].json.email}}`
+   - **Respond to Webhook (Respond Confirmation)**
+   - **Message**: Hi {{name}}, your meeting is confirmed for {{start}}.
+
+5. **False Branch (Booked)**
+   - Leads into the "alternative-finder" subflow
+
+#### 3C. Alternative-Finder Subflow
+1. **Function: Generate Candidates**
+   - **Node**: Generate Candidates
+   - **Reads**: startDateStr = items[0].json["Start-Date"]
+   - **Parses** as local UK time, eight one-hour offsets
+   - **Formats** each as "YYYY-MM-DDTHH:mm:ss" + +01:00 suffix
+   - **Returns** 8 items: `{ "start":"...+01:00","end":"...+01:00" }`
+
+2. **SplitInBatches (Loop Candidates)**
+   - **Batch Size**: 1
+
+3. **Google Calendar Get Events (Check Each Slot)**
+   - **TimeMin**: `{{$json.start}}`
+   - **TimeMax**: `{{$json.end}}`
+   - **Time Zone**: Europe/London
+
+4. **IF: Is Free?**
+   - **Node**: Is Free?
+   - **Condition**: `{{$node["Check Each Slot"].json.length === 0}}`
+   - **Keep Input Data**: Enabled
+
+5. **True → Build Human Message**
+   - **Node**: Build Alternative Message
+   - **Code**:
+     ```javascript
+     const iso = items[0].json["start"];
+     const dt  = new Date(iso);
+     const friendly = dt.toLocaleString('en-GB',{…}).replace(',', ' at');
+     const templates = [
+       `I'm sorry, that slot is booked. Would ${friendly} suit you instead?`,
+       /* …more variations… */
+     ];
+     const message = templates[Math.floor(Math.random()*templates.length)];
+     return [{ json:{ message }}];
+     ```
+
+6. **Respond to Webhook (Respond Alternatives)**
+   - **Output**: `{ "message": "{{message from Build Alternative Message}}" }`
+
+7. **False → loops back** to SplitInBatches, testing the next candidate until one is free or all 8 are exhausted.
+
+#### Termination
+Both the Respond Confirmation and Respond Alternatives nodes are terminal: once they fire, the workflow stops and sends the HTTP response back to the FastAPI app (and thus to the caller).
+
+#### Data Flow Summary
+- Incoming POST → Webhook → Switch route
+- Route 1 → Sheets lookup → greeting → Respond
+- Route 2 → save transcript/summary → Respond
+- Route 3 → normalize times → check slot →
+  - Available → create event → Respond
+  - Unavailable → generate + test 8 alternates → Respond first free
+
+#### Important Route Numbers
+- Route 1: Fetch chat history
+- Route 2: Save transcript/summary
+- Route 3: Schedule meeting
+
 Endpoints
 
 POST /incoming-call

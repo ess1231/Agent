@@ -126,39 +126,65 @@ async def query_knowledge_base(question: str) -> str:
         logger.error(f"Error querying knowledge base: {e}")
         return "I'm sorry, I encountered an error while searching the knowledge base."
 
-# Helper function to schedule meeting
-async def schedule_meeting(meeting_details: Dict) -> Dict:
-    """Schedule a meeting using N8N."""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings.n8n_webhook_url,
-                json={
-                    "route": "schedule_meeting",
-                    "details": meeting_details
-                }
-            )
-            return response.json()
-    except Exception as e:
-        logger.error(f"Error scheduling meeting: {e}")
-        return {"error": "Failed to schedule meeting"}
-
 # Helper function to fetch chat history from N8N
 async def fetch_chat_history(caller: str) -> Dict:
     """Fetch chat history from N8N and return the first message."""
     try:
+        if not settings.n8n_webhook_url:
+            logger.warning("N8N_WEBHOOK_URL is not set, using default welcome message")
+            return {"firstMessage": "Hello! How can I help you today?"}
+            
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings.n8n_webhook_url,
-                json={
-                    "route": "fetch_chat_history",
-                    "caller": caller
-                }
-            )
-            return response.json()
+            try:
+                response = await client.post(
+                    settings.n8n_webhook_url,
+                    json={
+                        "route": 1,  # Route 1 for fetch_chat_history
+                        "caller": caller
+                    },
+                    timeout=5.0  # Add a timeout
+                )
+                response.raise_for_status()  # Raise an exception for 4XX/5XX responses
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error while fetching chat history: {e.response.status_code} - {e.response.text}")
+                return {"firstMessage": "Hello! How can I help you today?"}
+            except httpx.RequestError as e:
+                logger.error(f"Request error while fetching chat history: {e}")
+                return {"firstMessage": "Hello! How can I help you today?"}
     except Exception as e:
         logger.error(f"Error fetching chat history: {e}")
         return {"firstMessage": "Hello! How can I help you today?"}
+
+# Helper function to schedule meeting
+async def schedule_meeting(meeting_details: Dict) -> Dict:
+    """Schedule a meeting using N8N."""
+    try:
+        if not settings.n8n_webhook_url:
+            logger.warning("N8N_WEBHOOK_URL is not set, cannot schedule meeting")
+            return {"message": "I'm sorry, meeting scheduling is not available at the moment."}
+            
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    settings.n8n_webhook_url,
+                    json={
+                        "route": 3,  # Route 3 for schedule_meeting
+                        "details": meeting_details
+                    },
+                    timeout=5.0  # Add a timeout
+                )
+                response.raise_for_status()  # Raise an exception for 4XX/5XX responses
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error while scheduling meeting: {e.response.status_code} - {e.response.text}")
+                return {"message": "I'm sorry, I encountered an error while trying to schedule your meeting. Please try again later."}
+            except httpx.RequestError as e:
+                logger.error(f"Request error while scheduling meeting: {e}")
+                return {"message": "I'm sorry, I couldn't connect to the scheduling service. Please try again later."}
+    except Exception as e:
+        logger.error(f"Error scheduling meeting: {e}")
+        return {"message": "I'm sorry, I encountered an unexpected error while scheduling your meeting."}
 
 # Helper function to save transcript and summary to N8N
 async def save_transcript_summary(session_id: str, transcript: str) -> Dict:
@@ -176,18 +202,32 @@ async def save_transcript_summary(session_id: str, transcript: str) -> Dict:
         )
         summary = summary_response.choices[0].message.content
 
+        # Skip N8N if webhook URL is not set
+        if not settings.n8n_webhook_url:
+            logger.warning("N8N_WEBHOOK_URL is not set, skipping saving transcript")
+            return {"status": "skipped"}
+            
         # Send transcript and summary to N8N
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings.n8n_webhook_url,
-                json={
-                    "route": "save_transcript_summary",
-                    "session_id": session_id,
-                    "transcript": transcript,
-                    "summary": summary
-                }
-            )
-            return response.json()
+            try:
+                response = await client.post(
+                    settings.n8n_webhook_url,
+                    json={
+                        "route": 2,  # Route 2 for save_transcript_summary
+                        "session_id": session_id,
+                        "transcript": transcript,
+                        "summary": summary
+                    },
+                    timeout=5.0  # Add a timeout
+                )
+                response.raise_for_status()  # Raise an exception for 4XX/5XX responses
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error while saving transcript: {e.response.status_code} - {e.response.text}")
+                return {"error": "Failed to save transcript due to HTTP error"}
+            except httpx.RequestError as e:
+                logger.error(f"Request error while saving transcript: {e}")
+                return {"error": "Failed to save transcript due to connection error"}
     except Exception as e:
         logger.error(f"Error saving transcript and summary: {e}")
         return {"error": "Failed to save transcript and summary"}
@@ -196,6 +236,11 @@ async def save_transcript_summary(session_id: str, transcript: str) -> Dict:
 def convert_mulaw_to_wav(mulaw_data, sample_rate=8000, channels=1):
     """Convert Twilio's mulaw audio to WAV format that OpenAI can process."""
     try:
+        # Check if there's enough audio data (at least 0.1 seconds at 8000 samples/sec)
+        if len(mulaw_data) < 800:  # 8000 samples/sec * 0.1 sec = 800 samples
+            logger.warning(f"Audio data too short: {len(mulaw_data)} bytes, need at least 800 bytes")
+            return None
+            
         # Convert mulaw to PCM
         pcm_data = audioop.ulaw2lin(mulaw_data, 2)  # 2 bytes per sample
         
@@ -215,6 +260,24 @@ def convert_mulaw_to_wav(mulaw_data, sample_rate=8000, channels=1):
     except Exception as e:
         logger.error(f"Error converting mulaw to WAV: {e}")
         return None
+
+# Buffer to accumulate audio data
+class AudioBuffer:
+    def __init__(self, min_length=8000):
+        self.buffer = bytearray()
+        self.min_length = min_length  # Minimum length for processing (1 second)
+        
+    def add_data(self, data):
+        """Add data to the buffer, return True if buffer exceeds minimum length"""
+        if data:
+            self.buffer.extend(data)
+        return len(self.buffer) >= self.min_length
+        
+    def get_data(self):
+        """Get the buffered data and clear the buffer"""
+        data = bytes(self.buffer)
+        self.buffer.clear()
+        return data
 
 # Incoming call endpoint
 @app.post("/incoming-call")
@@ -349,7 +412,7 @@ async def media_stream(websocket: WebSocket):
         logger.info(f"Successfully found session: {session_id}")
         session = sessions[session_id]
         
-        # Initialize OpenAI conversation
+        # Initialize OpenAI conversation and audio buffer
         messages = [
             {
                 "role": "system",
@@ -377,6 +440,9 @@ async def media_stream(websocket: WebSocket):
             }
         ]
         
+        # Initialize audio buffer for accumulating short audio chunks
+        audio_buffer = AudioBuffer(min_length=8000)  # 1 second at 8kHz
+        
         # IMPORTANT: Immediately send the welcome message
         try:
             logger.info(f"Sending welcome message: {session['first_message']}")
@@ -391,20 +457,50 @@ async def media_stream(websocket: WebSocket):
             )
             
             # Send welcome audio to Twilio
-            await websocket.send_json({
-                "event": "media",
-                "media": {
-                    "payload": base64.b64encode(speech_response.content).decode()
-                }
-            })
-            logger.info("Welcome message sent successfully")
+            try:
+                await websocket.send_json({
+                    "event": "media",
+                    "media": {
+                        "payload": base64.b64encode(speech_response.content).decode()
+                    }
+                })
+                logger.info("Welcome message sent successfully")
+            except Exception as e:
+                logger.error(f"WebSocket error sending welcome message: {e}")
+                if "WebSocket is not connected" in str(e):
+                    logger.warning("WebSocket disconnected, attempting to reconnect...")
+                    try:
+                        await websocket.accept()
+                        # Try sending again
+                        await websocket.send_json({
+                            "event": "media",
+                            "media": {
+                                "payload": base64.b64encode(speech_response.content).decode()
+                            }
+                        })
+                        logger.info("Welcome message sent after reconnection")
+                    except Exception as reconnect_error:
+                        logger.error(f"Failed to reconnect websocket: {reconnect_error}")
         except Exception as e:
-            logger.error(f"Error sending welcome message: {e}")
+            logger.error(f"Error generating welcome message: {e}")
         
         # Main conversation loop
         while True:
             try:
-                data = await websocket.receive_json()
+                # Set timeout for receiving data
+                try:
+                    data = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.warning("WebSocket receive timeout - no data received for 30 seconds")
+                    # Send a ping to check connection
+                    try:
+                        await websocket.send_json({"event": "ping"})
+                        logger.info("Ping sent to keep connection alive")
+                        continue
+                    except Exception as ping_error:
+                        logger.error(f"Failed to send ping, connection likely lost: {ping_error}")
+                        break
+                
                 if data.get("event") == "media":
                     audio_data = data.get("media", {}).get("payload")
                     if not audio_data:
@@ -416,25 +512,41 @@ async def media_stream(websocket: WebSocket):
                         # Decode base64 audio
                         audio_bytes = base64.b64decode(audio_data)
                         
+                        # Add to buffer
+                        if not audio_buffer.add_data(audio_bytes):
+                            logger.info("Buffering audio data, waiting for more...")
+                            continue
+                            
+                        # Get accumulated audio data
+                        buffered_audio = audio_buffer.get_data()
+                        logger.info(f"Processing {len(buffered_audio)} bytes of audio data")
+                        
                         # Convert mulaw to WAV format for OpenAI
-                        wav_bytes = convert_mulaw_to_wav(audio_bytes)
-                        if wav_bytes:
-                            audio_file = io.BytesIO(wav_bytes)
-                            audio_file.name = "audio.wav"
-                        else:
-                            # Fallback to raw decoding if conversion fails
-                            audio_file = io.BytesIO(audio_bytes)
-                            audio_file.name = "audio.wav"
+                        wav_bytes = convert_mulaw_to_wav(buffered_audio)
+                        if not wav_bytes:
+                            logger.warning("Failed to convert audio or audio too short, waiting for more")
+                            continue
+                            
+                        audio_file = io.BytesIO(wav_bytes)
+                        audio_file.name = "audio.wav"
                         
-                        # Transcribe audio
-                        audio_text = openai_client.audio.transcriptions.create(
-                            model="whisper-1",
-                            file=audio_file
-                        ).text
-                        
-                        logger.info(f"Transcribed text: {audio_text}")
+                        try:
+                            # Transcribe audio
+                            audio_text = openai_client.audio.transcriptions.create(
+                                model="whisper-1",
+                                file=audio_file
+                            ).text
+                            logger.info(f"Transcribed text: {audio_text}")
+                        except Exception as e:
+                            if "audio_too_short" in str(e):
+                                logger.warning("Audio too short for transcription, skipping this chunk")
+                                continue  # Skip this audio chunk and wait for more audio
+                            else:
+                                # For other errors, log and continue with fallback
+                                logger.error(f"Error transcribing audio: {e}")
+                                audio_text = "[Transcription failed. Please try again.]"
                     except Exception as e:
-                        logger.error(f"Error transcribing audio: {e}")
+                        logger.error(f"Error processing audio data: {e}")
                         # Set a fallback message if transcription fails
                         audio_text = "[Transcription failed. Please try again.]"
                     
@@ -515,12 +627,18 @@ async def media_stream(websocket: WebSocket):
                             speed=1.0
                         )
                         
-                        await websocket.send_json({
-                            "event": "media",
-                            "media": {
-                                "payload": base64.b64encode(speech_response.content).decode()
-                            }
-                        })
+                        try:
+                            await websocket.send_json({
+                                "event": "media",
+                                "media": {
+                                    "payload": base64.b64encode(speech_response.content).decode()
+                                }
+                            })
+                        except Exception as ws_error:
+                            logger.error(f"Error sending audio response: {ws_error}")
+                            if "WebSocket is not connected" in str(ws_error) or "Cannot call \"send\"" in str(ws_error):
+                                logger.warning("WebSocket connection lost, breaking conversation loop")
+                                break
                     except Exception as e:
                         logger.error(f"Error generating or sending response: {e}")
                         # Send fallback message if there's an error
