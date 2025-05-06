@@ -324,36 +324,41 @@ async def incoming_call(request: Request) -> Response:
             logger.warning(f"Failed to fetch chat history from n8n, using default greeting: {e}")
             first_message = "Hello! I'm your AI assistant. How can I help you today?"
 
-        # Create a session
-        session_id = f"session_{format_phone_number(caller)}"
-        sessions[session_id] = {
-            "caller": caller,
-            "transcript": "",
-            "first_message": first_message,
-            "created_at": datetime.now().isoformat()
-        }
-
-        # Get proper domain - ensure it has wss:// prefix
-        websocket_url = f"wss://{settings.full_domain}/media-stream"
-        logger.info(f"Using WebSocket URL: {websocket_url}")
-
-        # Generate TwiML to connect to media stream using domain from settings
-        # Add track attribute to make sure audio is bidirectional
+        # For debugging: Let's use a simple TwiML response first to test basic functionality
         twiml = f"""
         <Response>
-            <Connect>
-                <Stream url="{websocket_url}" track="both">
-                    <Parameter name="sessionId" value="{session_id}"/>
-                </Stream>
-            </Connect>
-            <Say>If you cannot hear the assistant, please wait a moment.</Say>
+            <Say>Hello! This is a direct TwiML test. I'm your AI assistant. Press any key to continue.</Say>
+            <Gather numDigits="1" action="/gather-test" method="POST">
+                <Say>Please press any key to test response.</Say>
+            </Gather>
+            <Say>No input received. Goodbye!</Say>
         </Response>
         """
-        logger.info(f"Returning TwiML: {twiml}")
+        logger.info(f"Returning simple TwiML test: {twiml}")
         return Response(content=twiml, media_type="text/xml")
+        
     except Exception as e:
         logger.error(f"Error handling incoming call: {str(e)}")
         return Response(content="<Response><Reject/></Response>", media_type="text/xml")
+
+# Test endpoint for Gather action
+@app.post("/gather-test")
+async def gather_test(request: Request) -> Response:
+    try:
+        form_data = await request.form()
+        digits = form_data.get("Digits", "")
+        logger.info(f"Received digits: {digits}")
+        
+        twiml = f"""
+        <Response>
+            <Say>You pressed {digits}. That confirms the phone connection is working. In a real scenario, we would use WebSockets for two-way audio. Goodbye for now!</Say>
+        </Response>
+        """
+        logger.info(f"Returning gather response: {twiml}")
+        return Response(content=twiml, media_type="text/xml")
+    except Exception as e:
+        logger.error(f"Error in gather-test: {str(e)}")
+        return Response(content="<Response><Say>Sorry, there was an error.</Say></Response>", media_type="text/xml")
 
 # Root endpoint for health check
 @app.get("/")
