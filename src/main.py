@@ -16,6 +16,7 @@ import io
 import wave
 import audioop
 import tempfile
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +40,8 @@ class Settings(BaseSettings):
     # Other settings
     n8n_webhook_url: str = os.getenv("N8N_WEBHOOK_URL", "")
     port: int = int(os.getenv("PORT", "8080"))
-    domain: str = os.getenv("RAILWAY_STATIC_URL", "localhost:8080")
+    domain: str = os.getenv("RAILWAY_STATIC_URL", "agent-production-b2f7.up.railway.app")
+    full_domain: str = os.getenv("FULL_DOMAIN", "agent-production-b2f7.up.railway.app")
 
 settings = Settings()
 
@@ -80,6 +82,15 @@ sessions: Dict[str, Dict] = {}
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Add CORS middleware to allow WebSockets from all origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Helper function to format phone number
 def format_phone_number(number: str) -> str:
@@ -279,6 +290,20 @@ class AudioBuffer:
         self.buffer.clear()
         return data
 
+# Simple WebSocket Echo Test
+@app.websocket("/ws-test")
+async def websocket_test(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("Test WebSocket connection accepted")
+    await websocket.send_text("WebSocket connection established!")
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logger.info(f"Received message in test websocket: {data}")
+            await websocket.send_text(f"You sent: {data}")
+    except WebSocketDisconnect:
+        logger.info("Test WebSocket disconnected")
+
 # Incoming call endpoint
 @app.post("/incoming-call")
 async def incoming_call(request: Request) -> Response:
@@ -308,12 +333,16 @@ async def incoming_call(request: Request) -> Response:
             "created_at": datetime.now().isoformat()
         }
 
+        # Get proper domain - ensure it has wss:// prefix
+        websocket_url = f"wss://{settings.full_domain}/media-stream"
+        logger.info(f"Using WebSocket URL: {websocket_url}")
+
         # Generate TwiML to connect to media stream using domain from settings
         # Add track attribute to make sure audio is bidirectional
         twiml = f"""
         <Response>
             <Connect>
-                <Stream url="wss://{settings.domain}/media-stream" track="both">
+                <Stream url="{websocket_url}" track="both">
                     <Parameter name="sessionId" value="{session_id}"/>
                 </Stream>
             </Connect>
@@ -326,21 +355,44 @@ async def incoming_call(request: Request) -> Response:
         logger.error(f"Error handling incoming call: {str(e)}")
         return Response(content="<Response><Reject/></Response>", media_type="text/xml")
 
+# Root endpoint for health check
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+# Health check for media-stream endpoint
+@app.get("/media-stream-health")
+async def media_stream_health():
+    return {"status": "media-stream endpoint is active"}
+
 # Media stream WebSocket handler
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     logger.info("WebSocket connection attempt received")
-    await websocket.accept()
+    
+    try:
+        await websocket.accept()
+        logger.info("WebSocket connection accepted successfully")
+    except Exception as e:
+        logger.error(f"Failed to accept WebSocket connection: {e}")
+        return
+        
     session_id = None
     connection_open = True
+    logger.info("Starting WebSocket handling for media stream")
     
     try:
         # 1. Wait for 'connected' event from Twilio
-        msg = await websocket.receive_json()
-        logger.info(f"Twilio event received: {msg}")
-        if msg.get("event") != "connected":
-            logger.warning(f"Expected 'connected' event but got: {msg.get('event')}")
-            # Continue anyway - some clients might have different handshakes
+        try:
+            logger.info("Waiting for initial 'connected' event from Twilio...")
+            msg = await websocket.receive_json()
+            logger.info(f"Twilio event received: {msg}")
+            if msg.get("event") != "connected":
+                logger.warning(f"Expected 'connected' event but got: {msg.get('event')}")
+                # Continue anyway - some clients might have different handshakes
+        except Exception as e:
+            logger.error(f"Error receiving initial event from Twilio: {e}")
+            return
         
         # 2. Wait for 'start' event, extract sessionId from multiple possible locations
         msg = await websocket.receive_json()
@@ -774,11 +826,6 @@ async def extract_meeting_details(text: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error extracting meeting details: {e}")
         return None
-
-# Root endpoint for health check
-@app.get("/")
-async def root():
-    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
